@@ -1,0 +1,32 @@
+ignore/
+target/
+shared/
+saves/
+.mcp.json
+launch.json
+tasks.json
+*.raw
+*.iso
+*.chd
+*.img
+prom.bin
+nvram.bin
+Cargo.lock
+iris.toml
+screenshot_*.png
+IRIS.app/
+/dist/
+*.log
+.DS_Store
+
+# Benchmark build products: the guest ELF, the native oracle and baseline, the
+# per-cell emulator copies, and the JSON results. golden/golden.h is generated
+# but deliberately checked in — building the suite must need nothing but the
+# MIPS cross toolchain.
+bench/build/
+
+# `j2 corpus` captures: tens of MB of binary page dumps, regenerated on demand
+# from any boot (see clanker/jitv2/corpus-capture-from-the-pcp-cache.md).
+jitv2_corpus/
+*.pcp
+pcp_dump_pfn_*.bin
