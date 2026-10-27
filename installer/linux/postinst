@@ -1,0 +1,30 @@
+#!/bin/sh
+# After installing the deb or rpm: create the `bsnfs` user, let it read its
+# config, and say how to start the service. The service is not started
+# automatically: there is nothing shared until the config names a folder.
+set -e
+
+if command -v systemd-sysusers >/dev/null 2>&1; then
+    systemd-sysusers /usr/lib/sysusers.d/bsnfs.conf
+elif ! getent passwd bsnfs >/dev/null 2>&1; then
+    useradd --system --home-dir /var/lib/bsnfs --no-create-home --shell /usr/sbin/nologin bsnfs 2>/dev/null \
+        || adduser --system --group --home /var/lib/bsnfs --no-create-home bsnfs
+fi
+
+if [ -f /etc/bsnfs/bsnfs.conf ]; then
+    chgrp bsnfs /etc/bsnfs/bsnfs.conf && chmod 0640 /etc/bsnfs/bsnfs.conf
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+cat <<'EOF'
+
+bsnfs is installed. To share a folder:
+  1. add a line like `share irix=/srv/irix` to /etc/bsnfs/bsnfs.conf
+     (or run as yourself instead: sudo bsnfs service install --user YOU /path/to/folder)
+  2. sudo systemctl enable --now bsnfs
+The admin page is then at http://127.0.0.1:8080/.
+EOF
+exit 0

@@ -2,6 +2,9 @@
 name = "bsnfs"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/danifunker/bsnfs"
 description = "A no-nonsense NFS (v2/v3) server that shares a folder on a modern host"
 
 [dependencies]
@@ -9,3 +12,6 @@ libc = "0.2"
 
 [profile.release]
 debug = 1
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"

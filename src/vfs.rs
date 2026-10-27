@@ -18,17 +18,22 @@
 //! and clients can walk back down to what they had open.
 //!
 //! **Containment**: wire names are validated single components, `..` is
-//! clamped at the export root, and symlinks inside the share are served as
-//! symlinks (the client resolves them) and never followed on the host.
+//! clamped at the export root, and every host access goes through
+//! [`crate::confine`], which never follows a symlink, so nothing a client
+//! does (including racing its own requests) reaches outside the export.
+//! Symlinks inside the share are served as symlinks for the client to
+//! resolve.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fs::{self, File, FileTimes, Metadata, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::confine::{self, Meta, Type};
 
 /// Fileid of every export's root directory.
 pub const ROOT_ID: u64 = 2;
@@ -66,6 +71,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
         use io::ErrorKind as K;
+        // A symlink where confine wanted a directory or file.
+        #[cfg(unix)]
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            return Error::Inval;
+        }
         match e.kind() {
             K::NotFound => Error::NoEnt,
             K::PermissionDenied => Error::Acces,
@@ -115,13 +125,19 @@ pub struct Time {
 }
 
 impl Time {
-    fn from_system(t: Option<SystemTime>) -> Self {
+    pub(crate) fn from_parts(secs: i64, nsecs: i64) -> Self {
+        Self { secs: secs.clamp(0, u32::MAX as i64) as u32, nsecs: nsecs.clamp(0, 999_999_999) as u32 }
+    }
+
+    #[cfg_attr(unix, allow(dead_code))] // used by the non-Unix confine
+    pub(crate) fn from_system(t: Option<SystemTime>) -> Self {
         t.and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| Self { secs: d.as_secs().min(u32::MAX as u64) as u32, nsecs: d.subsec_nanos() })
             .unwrap_or_default()
     }
 
-    fn to_system(self) -> SystemTime {
+    #[cfg_attr(unix, allow(dead_code))] // used by the non-Unix confine
+    pub(crate) fn to_system(self) -> SystemTime {
         UNIX_EPOCH + Duration::new(self.secs as u64, self.nsecs.min(999_999_999))
     }
 }
@@ -270,7 +286,7 @@ pub struct Export {
     fsid: u64,
     ids: Mutex<Ids>,
     /// Directory fileid → (its mtime when counted, number of subdirectories).
-    subdirs: Mutex<HashMap<u64, (SystemTime, u32)>>,
+    subdirs: Mutex<HashMap<u64, (Time, u32)>>,
 }
 
 impl Export {
@@ -288,36 +304,29 @@ impl Export {
 
     /// A directory's subdirectory count, recounted only when its mtime
     /// changes (adding or removing an entry always bumps it).
-    fn subdirs(&self, id: u64, rel: &Path, md: &Metadata) -> u32 {
-        let mtime = md.modified().ok();
+    fn subdirs(&self, id: u64, rel: &Path, md: &Meta) -> u32 {
         if let Some(&(t, n)) = self.subdirs.lock().unwrap().get(&id)
-            && Some(t) == mtime
+            && t == md.mtime
         {
             return n;
         }
-        let n = fs::read_dir(self.root.join(rel))
-            .map(|rd| rd.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).count())
-            .unwrap_or(0)
-            .min(u32::MAX as usize - 2) as u32;
-        if let Some(t) = mtime {
-            self.subdirs.lock().unwrap().insert(id, (t, n));
-        }
+        let n = confine::subdir_count(&self.root, rel).unwrap_or(0).min(u32::MAX as usize - 2) as u32;
+        self.subdirs.lock().unwrap().insert(id, (md.mtime, n));
         n
     }
 
     /// Synthetic attributes for the object `id` at `rel`, whose host metadata
     /// is `md`.
-    fn attr(&self, id: u64, rel: &Path, md: &Metadata) -> Attr {
-        let ft = md.file_type();
-        let (kind, mode) = if ft.is_dir() {
-            (Kind::Dir, 0o755)
-        } else if ft.is_symlink() {
-            (Kind::Lnk, 0o777)
-        } else {
-            (Kind::Reg, if host_executable(md) { 0o755 } else { 0o644 })
+    fn attr(&self, id: u64, rel: &Path, md: &Meta) -> Attr {
+        // The execute bit is the one host permission passed through, so
+        // scripts and binaries stay runnable.
+        let (kind, mode) = match md.kind {
+            Type::Dir => (Kind::Dir, 0o755),
+            Type::Symlink => (Kind::Lnk, 0o777),
+            Type::File | Type::Other => (Kind::Reg, if md.exec { 0o755 } else { 0o644 }),
         };
         let mode = if self.read_only() && kind != Kind::Lnk { mode & !0o222 } else { mode };
-        let mtime = Time::from_system(md.modified().ok());
+        let mtime = md.mtime;
         Attr {
             kind,
             mode,
@@ -327,10 +336,10 @@ impl Export {
             nlink: if kind == Kind::Dir { 2 + self.subdirs(id, rel, md) } else { 1 },
             uid: 0,
             gid: 0,
-            size: md.len(),
+            size: md.size,
             fsid: self.fsid,
             fileid: id,
-            atime: Time::from_system(md.accessed().ok()),
+            atime: md.atime,
             mtime,
             ctime: mtime, // no portable ctime; reuse mtime
         }
@@ -341,8 +350,13 @@ impl Export {
 struct Node {
     export: Arc<Export>,
     rel: PathBuf,
-    abs: PathBuf,
-    md: Metadata,
+    md: Meta,
+}
+
+impl Node {
+    fn lstat(&self, rel: &Path) -> Result<Meta> {
+        Ok(confine::lstat(&self.export.root, rel)?)
+    }
 }
 
 const LISTING_CACHE: usize = 64;
@@ -354,6 +368,9 @@ pub struct Vfs {
     /// Stamped into every non-root handle; changes on each start.
     generation: u32,
     listings: Mutex<HashMap<Handle, Arc<DirListing>>>,
+    /// Whether clients may create symlinks. They are never followed here,
+    /// but other programs on the host would follow them.
+    symlinks: AtomicBool,
 }
 
 impl Vfs {
@@ -361,7 +378,12 @@ impl Vfs {
     pub fn new(exports: Vec<(String, PathBuf, bool)>) -> io::Result<Self> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
         let generation = (now.subsec_nanos() ^ (now.as_secs() as u32).rotate_left(16) ^ std::process::id()) | 1;
-        let vfs = Self { exports: RwLock::new(Vec::new()), generation, listings: Mutex::new(HashMap::new()) };
+        let vfs = Self {
+            exports: RwLock::new(Vec::new()),
+            generation,
+            listings: Mutex::new(HashMap::new()),
+            symlinks: AtomicBool::new(true),
+        };
         for (name, path, read_only) in exports {
             vfs.add_export(&name, &path, read_only)?;
         }
@@ -400,6 +422,11 @@ impl Vfs {
             subdirs: Mutex::new(HashMap::new()),
         }));
         Ok(i)
+    }
+
+    /// Allow or refuse client requests to create symlinks.
+    pub fn set_symlinks(&self, allow: bool) {
+        self.symlinks.store(allow, Ordering::Relaxed);
     }
 
     /// Stop sharing an export. Clients holding its handles get STALE.
@@ -513,16 +540,15 @@ impl Vfs {
     fn resolve(&self, h: &Handle) -> Result<Node> {
         let export = self.export(h)?;
         let rel = export.rel(h.id)?;
-        let abs = export.root.join(&rel);
         // Gone from the host since we handed out the handle: stale.
-        let md = fs::symlink_metadata(&abs).map_err(|_| Error::Stale)?;
-        Ok(Node { export, rel, abs, md })
+        let md = confine::lstat(&export.root, &rel).map_err(|_| Error::Stale)?;
+        Ok(Node { export, rel, md })
     }
 
     /// Resolve a directory handle.
     fn resolve_dir(&self, h: &Handle) -> Result<Node> {
         let node = self.resolve(h)?;
-        if !node.md.is_dir() {
+        if node.md.kind != Type::Dir {
             return Err(Error::NotDir);
         }
         Ok(node)
@@ -541,21 +567,21 @@ impl Vfs {
     pub fn lookup(&self, dir: &Handle, name: &[u8]) -> Result<(Handle, Attr)> {
         let node = self.resolve_dir(dir)?;
         let rel = match name {
-            b"." => node.rel,
+            b"." => node.rel.clone(),
             b".." => node.rel.parent().map(Path::to_path_buf).unwrap_or_default(),
             _ => node.rel.join(component(name)?),
         };
-        let md = fs::symlink_metadata(node.export.root.join(&rel))?;
+        let md = node.lstat(&rel)?;
         let id = node.export.intern(&rel);
         Ok((Handle { export: dir.export, id }, node.export.attr(id, &rel, &md)))
     }
 
     pub fn readlink(&self, h: &Handle) -> Result<Vec<u8>> {
         let node = self.resolve(h)?;
-        if !node.md.file_type().is_symlink() {
+        if node.md.kind != Type::Symlink {
             return Err(Error::Inval);
         }
-        Ok(name_bytes(fs::read_link(&node.abs)?.into_os_string()))
+        Ok(confine::read_link(&node.export.root, &node.rel)?)
     }
 
     /// List a directory, `.` and `..` first, then the entries by name. With
@@ -567,34 +593,32 @@ impl Vfs {
         }
         let node = self.resolve_dir(dir)?;
         let export = &node.export;
-        let entry = |name: Vec<u8>, rel: &Path, md: &Metadata| {
+        let entry = |name: Vec<u8>, rel: &Path, md: &Meta| {
             let id = export.intern(rel);
             DirEntry { name, handle: Handle { export: dir.export, id }, attr: export.attr(id, rel, md) }
         };
         let mut entries = Vec::new();
         let parent = node.rel.parent().map(Path::to_path_buf).unwrap_or_default();
         for (name, rel) in [(&b"."[..], &node.rel), (&b".."[..], &parent)] {
-            if let Ok(md) = fs::symlink_metadata(export.root.join(rel)) {
+            if let Ok(md) = node.lstat(rel) {
                 entries.push(entry(name.to_vec(), rel, &md));
             }
         }
         let mut children = Vec::new();
-        for ent in fs::read_dir(&node.abs)? {
-            let ent = ent?;
-            let name = name_bytes(ent.file_name());
+        for (os_name, md) in confine::read_dir(&export.root, &node.rel)? {
+            let name = name_bytes(os_name.clone());
             // Skip anything that wouldn't round-trip as a safe component.
             if component(&name).is_err() {
                 continue;
             }
-            let Ok(md) = fs::symlink_metadata(ent.path()) else { continue }; // vanished meanwhile
-            children.push((name, ent.file_name(), md));
+            children.push((name, os_name, md));
         }
         // Sorted, so a re-read after cache eviction keeps cookie positions.
         children.sort_by(|a, b| a.0.cmp(&b.0));
         for (name, os_name, md) in children {
             entries.push(entry(name, &node.rel.join(os_name), &md));
         }
-        let mtime = Time::from_system(node.md.modified().ok());
+        let mtime = node.md.mtime;
         let listing = Arc::new(DirListing { verifier: ((mtime.secs as u64) << 32) | mtime.nsecs as u64, entries });
         let mut cache = self.listings.lock().unwrap();
         if cache.len() >= LISTING_CACHE {
@@ -607,19 +631,13 @@ impl Vfs {
     /// Capacity of the host filesystem holding the object, so clients see
     /// the real free space.
     pub fn fsstat(&self, h: &Handle) -> Result<FsStat> {
-        disk_space(&self.resolve(h)?.abs)
+        disk_space(&self.resolve(h)?.export.root)
     }
 
     // ── file data ───────────────────────────────────────────────────────────
 
     fn open_file(node: &Node, write: bool) -> Result<File> {
-        if node.md.is_dir() {
-            return Err(Error::IsDir);
-        }
-        if !node.md.is_file() {
-            return Err(Error::Inval); // a symlink: never followed on the host
-        }
-        Ok(OpenOptions::new().read(!write).write(write).open(&node.abs)?)
+        Ok(confine::open_file(&node.export.root, &node.rel, write, None)?)
     }
 
     /// Read up to `count` bytes at `offset`. Returns the data and whether it
@@ -659,8 +677,8 @@ impl Vfs {
     /// Flush a file's data to stable storage (NFSv3 COMMIT).
     pub fn commit(&self, h: &Handle) -> Result<()> {
         let node = self.resolve(h)?;
-        if node.md.is_file() && !node.export.read_only() {
-            Self::open_file(&node, true)?.sync_all()?;
+        if node.md.kind == Type::File {
+            Self::open_file(&node, false)?.sync_all()?;
         }
         Ok(())
     }
@@ -674,7 +692,7 @@ impl Vfs {
         if sa.size.is_some() || sa.atime != SetTime::DontChange || sa.mtime != SetTime::DontChange {
             writable(&node.export)?;
         }
-        apply(&node.abs, &node.md, sa)
+        apply(&node.export.root, &node.rel, &node.md, sa)
     }
 
     // ── namespace changes ───────────────────────────────────────────────────
@@ -689,54 +707,41 @@ impl Vfs {
 
     /// Intern a newly created object and return its handle and attributes.
     fn created(&self, dir: &Handle, export: &Export, rel: &Path) -> Result<(Handle, Attr)> {
-        let md = fs::symlink_metadata(export.root.join(rel))?;
+        let md = confine::lstat(&export.root, rel)?;
         let id = export.intern(rel);
         Ok((Handle { export: dir.export, id }, export.attr(id, rel, &md)))
     }
 
     pub fn create(&self, dir: &Handle, name: &[u8], how: CreateMode, sa: &SetAttr) -> Result<(Handle, Attr)> {
         let (export, rel) = self.child(dir, name)?;
-        let abs = export.root.join(&rel);
         // Never open through a symlink, or onto a directory.
-        if let Ok(md) = fs::symlink_metadata(&abs)
-            && !md.is_file()
+        if let Ok(md) = confine::lstat(&export.root, &rel)
+            && md.kind != Type::File
         {
-            return Err(if how == CreateMode::Guarded || !md.is_dir() { Error::Exist } else { Error::IsDir });
+            return Err(if how == CreateMode::Guarded || md.kind != Type::Dir { Error::Exist } else { Error::IsDir });
         }
-        let mut o = OpenOptions::new();
-        o.write(true);
-        match how {
-            CreateMode::Unchecked => o.create(true),
-            CreateMode::Guarded => o.create_new(true),
-        };
-        let f = o.open(&abs)?;
-        apply(&abs, &f.metadata()?, sa)?;
+        confine::open_file(&export.root, &rel, true, Some(how == CreateMode::Guarded))?;
+        apply(&export.root, &rel, &confine::lstat(&export.root, &rel)?, sa)?;
         self.created(dir, &export, &rel)
     }
 
     pub fn mkdir(&self, dir: &Handle, name: &[u8], sa: &SetAttr) -> Result<(Handle, Attr)> {
         let (export, rel) = self.child(dir, name)?;
-        let abs = export.root.join(&rel);
-        fs::create_dir(&abs)?;
-        apply(&abs, &fs::symlink_metadata(&abs)?, &SetAttr { size: None, ..sa.clone() })?;
+        confine::mkdir(&export.root, &rel)?;
+        apply(&export.root, &rel, &confine::lstat(&export.root, &rel)?, &SetAttr { size: None, ..sa.clone() })?;
         self.created(dir, &export, &rel)
     }
 
     pub fn symlink(&self, dir: &Handle, name: &[u8], target: &[u8]) -> Result<(Handle, Attr)> {
         let (export, rel) = self.child(dir, name)?;
+        if !self.symlinks.load(Ordering::Relaxed) {
+            return Err(Error::Acces);
+        }
         if target.is_empty() || target.contains(&0) {
             return Err(Error::Inval);
         }
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(os_string_from_bytes(target)?, export.root.join(&rel))?;
-            self.created(dir, &export, &rel)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (export, rel);
-            Err(Error::NotSupp)
-        }
+        confine::symlink(&export.root, &rel, &os_string_from_bytes(target)?)?;
+        self.created(dir, &export, &rel)
     }
 
     /// Hard-link `file` as `name` in `dir`.
@@ -745,33 +750,31 @@ impl Vfs {
             return Err(Error::Xdev);
         }
         let src = self.resolve(file)?;
-        if src.md.is_dir() {
+        if src.md.kind == Type::Dir {
             return Err(Error::IsDir);
         }
         let (export, rel) = self.child(dir, name)?;
-        fs::hard_link(&src.abs, export.root.join(&rel))?;
+        confine::hard_link(&export.root, &src.rel, &rel)?;
         export.intern(&rel);
         Ok(())
     }
 
     pub fn remove(&self, dir: &Handle, name: &[u8]) -> Result<()> {
         let (export, rel) = self.child(dir, name)?;
-        let abs = export.root.join(&rel);
-        if fs::symlink_metadata(&abs)?.is_dir() {
+        if confine::lstat(&export.root, &rel)?.kind == Type::Dir {
             return Err(Error::IsDir);
         }
-        fs::remove_file(&abs)?;
+        confine::remove(&export.root, &rel, false)?;
         export.ids.lock().unwrap().forget(&rel);
         Ok(())
     }
 
     pub fn rmdir(&self, dir: &Handle, name: &[u8]) -> Result<()> {
         let (export, rel) = self.child(dir, name)?;
-        let abs = export.root.join(&rel);
-        if !fs::symlink_metadata(&abs)?.is_dir() {
+        if confine::lstat(&export.root, &rel)?.kind != Type::Dir {
             return Err(Error::NotDir);
         }
-        fs::remove_dir(&abs)?;
+        confine::remove(&export.root, &rel, true)?;
         export.ids.lock().unwrap().forget(&rel);
         Ok(())
     }
@@ -787,7 +790,7 @@ impl Vfs {
         if to_rel.starts_with(&from_rel) && to_rel != from_rel {
             return Err(Error::Inval); // a directory into its own subtree
         }
-        fs::rename(export.root.join(&from_rel), export.root.join(&to_rel))?;
+        confine::rename(&export.root, &from_rel, &to_rel)?;
         export.ids.lock().unwrap().rename(&from_rel, &to_rel);
         Ok(())
     }
@@ -834,56 +837,21 @@ fn writable(export: &Export) -> Result<()> {
     if export.read_only() { Err(Error::RoFs) } else { Ok(()) }
 }
 
-/// Apply size and time changes to the object at `abs` (`md` is its lstat).
-fn apply(abs: &Path, md: &Metadata, sa: &SetAttr) -> Result<()> {
-    if md.file_type().is_symlink() {
+/// Apply size and time changes to `rel` (`md` is its current attributes).
+fn apply(root: &Path, rel: &Path, md: &Meta, sa: &SetAttr) -> Result<()> {
+    if md.kind == Type::Symlink {
         return Ok(()); // nothing to change on the link itself, portably
     }
     if let Some(size) = sa.size {
-        if md.is_dir() {
+        if md.kind == Type::Dir {
             return Err(Error::IsDir);
         }
-        OpenOptions::new().write(true).open(abs)?.set_len(size)?;
+        confine::truncate(root, rel, size)?;
     }
-    let pick = |t: SetTime| match t {
-        SetTime::DontChange => None,
-        SetTime::ServerTime => Some(SystemTime::now()),
-        SetTime::Client(t) => Some(t.to_system()),
-    };
-    let (atime, mtime) = (pick(sa.atime), pick(sa.mtime));
-    if atime.is_none() && mtime.is_none() {
-        return Ok(());
+    if sa.atime != SetTime::DontChange || sa.mtime != SetTime::DontChange {
+        confine::set_times(root, rel, sa.atime, sa.mtime)?;
     }
-    let mut times = FileTimes::new();
-    if let Some(t) = atime {
-        times = times.set_accessed(t);
-    }
-    if let Some(t) = mtime {
-        times = times.set_modified(t);
-    }
-    let f = if md.is_dir() {
-        // Opening a directory as a File works on Unix; elsewhere skip it.
-        if cfg!(unix) { File::open(abs)? } else { return Ok(()) }
-    } else {
-        OpenOptions::new().write(true).open(abs)?
-    };
-    f.set_times(times)?;
     Ok(())
-}
-
-/// The execute bit is the one host permission passed through, so scripts and
-/// binaries stay runnable. Elsewhere files are 0644.
-fn host_executable(md: &Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        md.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = md;
-        false
-    }
 }
 
 /// Export names are absolute, slash-separated, without `.`/`..` parts.
@@ -903,8 +871,7 @@ fn component(name: &[u8]) -> Result<PathBuf> {
     if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') || name.contains(&0) {
         return Err(Error::Inval);
     }
-    // Backslash and colon are separators (or worse) on Windows.
-    if cfg!(windows) && name.iter().any(|&b| b == b'\\' || b == b':') {
+    if cfg!(windows) && !windows_safe(name) {
         return Err(Error::Inval);
     }
     let p = PathBuf::from(os_string_from_bytes(name)?);
@@ -913,6 +880,26 @@ fn component(name: &[u8]) -> Result<PathBuf> {
         (Some(Component::Normal(_)), None) => Ok(p),
         _ => Err(Error::Inval),
     }
+}
+
+/// Names Windows would read as something other than a file in this folder:
+/// path separators, `:` (drive letters, alternate data streams), trailing
+/// dots and spaces (silently stripped), and the reserved device names, which
+/// open a device whatever folder or extension they're given (`NUL.txt`).
+fn windows_safe(name: &[u8]) -> bool {
+    if name.iter().any(|&b| matches!(b, b'\\' | b':' | b'*' | b'?' | b'"' | b'<' | b'>' | b'|') || b < 0x20) {
+        return false;
+    }
+    if matches!(name.last(), Some(b'.' | b' ')) {
+        return false;
+    }
+    let stem = name.split(|&b| b == b'.').next().unwrap_or(name);
+    let stem = String::from_utf8_lossy(stem).trim_end().to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && matches!(stem.as_bytes()[3], b'0'..=b'9' | 0xB9 | 0xB2 | 0xB3));
+    !reserved
 }
 
 /// Bytes → OS string. On Unix names are arbitrary bytes; elsewhere they must
@@ -1121,6 +1108,57 @@ mod tests {
         assert_eq!(fs::read(outside.join("secret")).unwrap(), b"nope");
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&outside).ok();
+    }
+
+    /// The race a client can stage: get a handle to `d/f`, then swap `d` for
+    /// a symlink to somewhere outside. The handle must not follow it.
+    #[cfg(unix)]
+    #[test]
+    fn swapped_in_symlink_does_not_redirect_a_handle() {
+        let root = temp_dir();
+        let outside = temp_dir();
+        fs::create_dir(root.join("d")).unwrap();
+        fs::write(root.join("d/f"), b"inside").unwrap();
+        fs::write(outside.join("f"), b"outside").unwrap();
+        let v = vfs(&root);
+        let r = v.root(0).unwrap();
+        let d = v.lookup(&r, b"d").unwrap().0;
+        let f = v.lookup(&d, b"f").unwrap().0;
+        fs::rename(root.join("d"), root.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("d")).unwrap();
+        assert!(v.read(&f, 0, 100).is_err());
+        assert!(v.write(&f, 0, b"pwned", false).is_err());
+        assert!(v.setattr(&f, &SetAttr { size: Some(0), ..Default::default() }).is_err());
+        assert!(v.create(&d, b"new", CreateMode::Unchecked, &SetAttr::default()).is_err());
+        assert!(v.remove(&d, b"f").is_err());
+        assert!(v.readdir(&d, true).is_err());
+        assert_eq!(fs::read(outside.join("f")).unwrap(), b"outside");
+        assert!(!outside.join("new").exists());
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn windows_device_names_are_refused() {
+        for bad in [&b"CON"[..], b"nul.txt", b"Com1", b"LPT9.log", b"a:b", b"x\\y", b"trailing.", b"space ", b"q?"] {
+            assert!(!windows_safe(bad), "{}", String::from_utf8_lossy(bad));
+        }
+        for ok in [&b"console"[..], b"COM10", b"nullable.txt", b"readme.txt", b".profile"] {
+            assert!(windows_safe(ok), "{}", String::from_utf8_lossy(ok));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_creation_can_be_refused() {
+        let root = temp_dir();
+        let v = vfs(&root);
+        let r = v.root(0).unwrap();
+        v.set_symlinks(false);
+        assert_eq!(v.symlink(&r, b"l", b"/etc").unwrap_err(), Error::Acces);
+        v.set_symlinks(true);
+        v.symlink(&r, b"l", b"/etc").unwrap();
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

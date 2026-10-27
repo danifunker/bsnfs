@@ -3,7 +3,9 @@
 
 use std::io;
 use std::net::{SocketAddr, TcpListener, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::config::{self, Config, ExportSpec, PortmapMode};
 use crate::nfs::{self, mount::Mount, nlm::Nlm, Nfs};
@@ -66,6 +68,7 @@ fn serve(d: &Arc<Dispatcher>, socks: (Option<UdpSocket>, Option<TcpListener>, u1
 
 pub fn start(cfg: Config) -> io::Result<Arc<Server>> {
     let vfs = Arc::new(Vfs::new(cfg.exports.iter().map(|e| (e.name.clone(), e.path.clone(), e.read_only)).collect())?);
+    vfs.set_symlinks(cfg.symlinks);
     let mount = Arc::new(Mount::new(vfs.clone()));
     let pmap = Arc::new(Portmap::new(Vec::new()));
     let mut programs: Vec<Arc<dyn Program>> =
@@ -154,7 +157,62 @@ fn register_system(cfg: &Config, maps: &[Mapping], registered: &mut Vec<Mapping>
     }
 }
 
+/// Run a server until `stop` is set. This is the whole of `bsnfs` from the
+/// command line, and the body of the Windows service.
+pub fn run(cfg: Config, stop: &AtomicBool) -> io::Result<()> {
+    crate::log::set_level(cfg.verbosity);
+    if let Some(f) = &cfg.log_file {
+        crate::log::set_file(f).map_err(|e| io::Error::new(e.kind(), format!("log file {}: {e}", f.display())))?;
+    }
+    let server = start(cfg)?;
+    server.log_banner();
+    while !stop.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    info!("shutting down");
+    server.shutdown();
+    Ok(())
+}
+
 impl Server {
+    /// Log what we're serving and how clients reach it.
+    pub fn log_banner(&self) {
+        let p = self.ports;
+        let transports = match (self.cfg.udp, self.cfg.tcp) {
+            (true, true) => "udp+tcp",
+            (true, false) => "udp",
+            _ => "tcp",
+        };
+        let versions: Vec<String> = self.cfg.versions.iter().map(|v| format!("v{v}")).collect();
+        info!("bsnfs {} serving NFS {} on {}:{} ({transports})", crate::VERSION, versions.join("/"), self.cfg.bind, p.nfs);
+        if p.mount != p.nfs {
+            info!("  MOUNT on port {}", p.mount);
+        }
+        match p.nlm {
+            Some(n) if n != p.nfs => info!("  lock manager on port {n}"),
+            Some(_) => {}
+            None => info!("  lock manager off: clients should mount with -o nolock"),
+        }
+        match p.portmap {
+            PortmapState::Own(port) => info!("  portmapper on port {port}"),
+            PortmapState::System => info!("  registered with the host's portmapper"),
+            PortmapState::None => info!("  no portmapper: clients need -o port={},mountport={}", p.nfs, p.mount),
+        }
+        if let Some(a) = p.admin {
+            info!("  admin page on http://{a}/");
+        }
+        let exports = self.vfs.exports();
+        if exports.is_empty() {
+            warn!("no folders shared yet; add some on the admin page");
+        }
+        for (_, e) in &exports {
+            info!("  {} -> {}{}", e.name, e.root.display(), if e.read_only() { " (read-only)" } else { "" });
+        }
+        if let Some((_, e)) = exports.first() {
+            info!("  e.g.: {}", self.mount_hint("THIS_HOST", &e.name));
+        }
+    }
+
     /// Undo portmapper registrations. Call before exiting.
     pub fn shutdown(&self) {
         if !self.registered.is_empty() {

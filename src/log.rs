@@ -1,9 +1,33 @@
-//! Minimal leveled logging to stderr. Level 0 = warnings only, 1 = normal
-//! (startup, mounts), 2 = every RPC call, 3 = call details and errors.
+//! Minimal leveled logging to stderr, or to a file for services that have
+//! no console. Level 0 = warnings only, 1 = normal (startup, mounts),
+//! 2 = every RPC call, 3 = call details and errors.
 
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 static LEVEL: AtomicU8 = AtomicU8::new(1);
+static FILE: Mutex<Option<File>> = Mutex::new(None);
+
+/// Append log lines to `path` instead of stderr.
+pub fn set_file(path: &Path) -> std::io::Result<()> {
+    let f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    *FILE.lock().unwrap() = Some(f);
+    Ok(())
+}
+
+/// Write one finished log line.
+pub fn emit(line: std::fmt::Arguments) {
+    let line = format!("{} {line}\n", timestamp());
+    match FILE.lock().unwrap().as_mut() {
+        Some(f) => {
+            let _ = f.write_all(line.as_bytes());
+        }
+        None => eprint!("{line}"),
+    }
+}
 
 pub fn set_level(level: u8) {
     LEVEL.store(level, Ordering::Relaxed);
@@ -39,7 +63,7 @@ pub fn timestamp() -> String {
 macro_rules! log_at {
     ($lvl:expr, $($t:tt)*) => {
         if $crate::log::enabled($lvl) {
-            eprintln!("{} {}", $crate::log::timestamp(), format_args!($($t)*));
+            $crate::log::emit(format_args!($($t)*));
         }
     };
 }

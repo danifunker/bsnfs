@@ -7,24 +7,32 @@ command. No kernel NFS server, no `/etc/exports`, no root. Why this exists:
 - NFS v2 and v3, over UDP and TCP
 - Built-in portmapper, mount service and lock manager
 - A web page for managing shares
-- macOS and Linux, natively or in Docker
+- Clients are locked inside the folders you share
+- Runs on macOS, Linux and Windows, by hand or as a service, or in Docker
 
 ## Getting started
 
-### 1. Build it
+### 1. Install it
 
-You need [Rust](https://rustup.rs) installed.
+Download the file for your system from the
+[Releases](https://github.com/danifunker/bsnfs/releases) page:
 
-```sh
-cargo build --release
-```
+| System | Download | Then |
+| --- | --- | --- |
+| Windows | `bsnfs-setup-windows-x64-….exe` (or `arm64`) | Run it. It can set bsnfs up as a service and opens the admin page. |
+| Debian, Ubuntu | `bsnfs-linux-x64-….deb` (or `arm64`) | `sudo apt install ./bsnfs-linux-*.deb` |
+| Fedora, RHEL, openSUSE | `bsnfs-linux-x64-….rpm` | `sudo dnf install ./bsnfs-linux-*.rpm` |
+| Arch | `bsnfs-linux-x64-….pkg.tar.zst` | `sudo pacman -U bsnfs-linux-*.pkg.tar.zst` |
+| Any Linux | `bsnfs-linux-x64-….tar.gz` | Unpack; the `bsnfs` program runs on any distribution. |
+| macOS | `bsnfs-macos-universal-….tar.gz` | Unpack, then `sudo mv bsnfs /usr/local/bin/`. |
 
-The program is now at `target/release/bsnfs`.
+Or build it yourself with [Rust](https://rustup.rs): `cargo build --release`
+puts the program at `target/release/bsnfs`.
 
 ### 2. Share a folder
 
 ```sh
-./target/release/bsnfs ~/Shared
+bsnfs ~/Shared
 ```
 
 That shares `~/Shared` under the name `/Shared`. You'll see something like:
@@ -80,8 +88,61 @@ file to save them in:
 bsnfs -c ~/.bsnfs-exports
 ```
 
-To use the page from another machine:
-`bsnfs --admin 0.0.0.0:8080 --admin-password something ~/Shared`.
+To use the page from another machine, give it a password (it won't start
+without one): `bsnfs --admin 0.0.0.0:8080 --admin-password something ~/Shared`.
+
+### 5. Run it as a service
+
+To have bsnfs start at boot and keep running without a terminal:
+
+```sh
+sudo bsnfs service install ~/Shared        # macOS and Linux
+bsnfs service install C:\Shared            # Windows, as Administrator
+```
+
+This registers bsnfs with the system's own service manager (systemd, launchd,
+or Windows Services), writes a config file, and starts it. On macOS and Linux
+it runs as you (the user who ran `sudo`), so your permissions apply; pass
+`--user NAME` to pick another account.
+
+Settings live in a plain-text config file, one option per line:
+
+| System | Config file | Restart after editing |
+| --- | --- | --- |
+| Linux | `/etc/bsnfs/bsnfs.conf` | `sudo systemctl restart bsnfs` |
+| macOS | `/Library/Application Support/bsnfs/bsnfs.conf` | `sudo launchctl kickstart -k system/io.github.danifunker.bsnfs` |
+| Windows | `C:\ProgramData\bsnfs\bsnfs.conf` | `Restart-Service bsnfs` |
+
+```
+# Folders to share
+share irix=/srv/irix
+share pics=/home/you/Pictures
+
+# Admin page, reachable from the network
+admin 0.0.0.0:8080
+admin-password change-me
+
+read-only
+```
+
+Any option from [All options](#all-options) works, without the dashes. The
+same file works by hand: `bsnfs --config myconfig.conf`.
+
+To remove the service: `sudo bsnfs service uninstall` (the config is kept).
+
+Notes:
+
+- **Linux packages** (deb, rpm, Arch) install the service for a dedicated
+  `bsnfs` account but don't start it. Add `share` lines to
+  `/etc/bsnfs/bsnfs.conf` and run `sudo systemctl enable --now bsnfs`, making
+  sure the `bsnfs` account can read the folders. Or run it as yourself
+  instead with `sudo bsnfs service install --user you /path/to/folder`.
+- **macOS** keeps services out of Desktop, Documents, Downloads, iCloud
+  Drive and external disks. To share a folder there, add the `bsnfs` program
+  under System Settings > Privacy & Security > Full Disk Access.
+- **Windows**: the service runs as LocalSystem, which can read every file,
+  unless you install it with `--user NAME --password PW`. Its log is
+  `C:\ProgramData\bsnfs\bsnfs.log`.
 
 ## Who can do what
 
@@ -102,6 +163,39 @@ On the client, `chmod` and `chown` appear to succeed but change nothing.
 Changing a file's size or timestamps does work (`touch`, `tar`, `rsync -t`).
 A file that's executable on your computer shows as executable on the client.
 
+## What clients can't do
+
+bsnfs is meant to keep old, unauthenticated NFS clients inside the folders
+you share. Clients can't get out of a shared folder, however they try:
+
+- **No path tricks.** Every name a client sends must be a single plain
+  name; `..` stops at the top of the share.
+- **No symlink escapes.** Clients can see and create symlinks, but bsnfs
+  never follows one on your computer, so a link to `/etc` inside a share
+  can't be used to reach `/etc`. On macOS and Linux this holds even if a
+  client races its own requests to swap a folder for a symlink mid-operation:
+  bsnfs walks each path one step at a time and refuses any link along the way.
+  (Windows: best effort, see Limitations.)
+- **No handles to anything else.** A file handle can only name something
+  already inside the share; forged or old handles are refused.
+- **No reaching the admin page from websites.** It only answers to its own
+  address, `localhost`, IP addresses and this machine's name, so a web page
+  can't trick your browser into using it. Off this machine it requires a
+  password.
+
+You can tighten things further:
+
+- `--share-root /srv/nfs` lets the admin page share (and browse) only folders
+  inside `/srv/nfs`.
+- `--no-symlinks` stops clients creating symlinks. bsnfs never follows them,
+  but other programs on your computer (backup tools, file browsers, a future
+  FTP or HTTP service) might.
+- `--read-only`, and `--bind` with a firewall, to limit who can reach it.
+
+What it doesn't protect against: anyone who can reach the server can mount
+it (NFS v2/v3 have no real authentication), and they can do anything the
+account bsnfs runs as can do *inside* the shared folders.
+
 ## Running in Docker
 
 ```sh
@@ -111,7 +205,8 @@ docker compose up -d
 Before that, edit `docker-compose.yml`:
 
 - replace `./shared` with the folder you want to share
-- change `BSNFS_ADMIN_PASSWORD`
+- change `BSNFS_ADMIN_PASSWORD` (required: the container won't start without
+  one, because its admin page listens on the network)
 - set `user: "1000:1000"` to your own user and group IDs (`id -u`, `id -g`),
   so files clients create belong to you
 
@@ -154,6 +249,11 @@ bsnfs was restarted, or the file was renamed or deleted directly on your
 computer while a client was using it. `cd` out and back in, or reopen the
 file. No remount needed.
 
+**The admin page says "unexpected Host name"**
+You opened it by a name it doesn't know (to stop websites abusing it, it
+answers only to IP addresses, `localhost`, `*.local` and this machine's own
+name). Use the IP address, or allow the name: `--admin-host nas.example.lan`.
+
 **Seeing what's happening**
 Run with `-v` to log every request, or `-vv` to also log errors. The web page
 shows recent requests too.
@@ -162,7 +262,10 @@ shows recent requests too.
 
 ```
 bsnfs [OPTIONS] [[NAME=]DIR]...
+bsnfs service install [--user NAME] [--config FILE] [[NAME=]DIR]...
+bsnfs service uninstall
 
+  -C, --config FILE        read options from FILE first (one per line, no dashes)
   -p, --port PORT          NFS port; MOUNT and the lock manager share it (default 2049)
       --mount-port PORT    run MOUNT on its own port instead
       --nlm-port PORT      run the lock manager on its own port instead
@@ -175,9 +278,15 @@ bsnfs [OPTIONS] [[NAME=]DIR]...
   -r, --read-only          share everything read-only
       --admin ADDR:PORT    web page address (default 127.0.0.1:8080)
       --no-admin           no web page
-      --admin-password PW  password for the web page (or BSNFS_ADMIN_PASSWORD)
+      --admin-password PW  password for the web page (or BSNFS_ADMIN_PASSWORD);
+                           required when the page listens beyond this machine
+      --admin-host NAME    also answer the web page under this host name
+      --share-root DIR     the web page may only share folders inside DIR (repeatable)
+      --no-symlinks        refuse client requests to create symlinks
   -c, --exports-file FILE  load shares from FILE; web page changes are saved there
+      --log-file FILE      log to FILE instead of the terminal
   -v / -vv / -q            log every request / also errors / warnings only
+  -V, --version
   -h, --help
 ```
 
@@ -191,7 +300,10 @@ The exports file is plain text, one share per line: `NAME<TAB>PATH`, with
 - File locks are always granted but not enforced between clients.
 - NFSv2 can't handle files over 4 GiB (a protocol limit).
 - No NFSv4 yet. (NFSv1 was never released, so v2 is the oldest there is.)
-- Windows hosts: not built or tested yet.
+- Windows hosts: built by the release pipeline but not yet tried on a real
+  machine. Containment there is best effort: each step of a path is checked
+  for symlinks and junctions, but a client racing its own requests could in
+  principle slip one in between check and use. Symlinks can't be created.
 
 ## How it works
 
@@ -240,3 +352,35 @@ src/
 cargo test                   # unit tests + end-to-end tests over real sockets
 cargo clippy --all-targets
 ```
+
+### Making releases
+
+Everything is built by the scripts in `scripts/dist/`, which GitHub Actions
+runs. `.github/workflows/`:
+
+- `ci.yml`: lint and test on Linux, macOS and Windows for every push.
+- `nightly.yml`: every day, builds `main` and replaces the `nightly`
+  pre-release.
+- `release.yml`: `git tag v1.2.3 && git push origin v1.2.3` builds and
+  publishes release 1.2.3.
+
+For a notarized macOS binary, add these repository secrets (otherwise it's
+signed ad hoc, and macOS asks users to approve it on first run):
+
+| Secret | What it is |
+| --- | --- |
+| `MACOS_CERTIFICATE`, `MACOS_CERTIFICATE_PWD` | base64 of a .p12 with your **Developer ID Application** certificate and key, and its password |
+| `APP_STORE_CONNECT_KEY_ID`, `APP_STORE_CONNECT_ISSUER_ID`, `APP_STORE_CONNECT_PRIVATE_KEY` | an App Store Connect API key (base64 of the .p8), for notarization |
+
+(or `MACOS_NOTARIZE_APPLE_ID`, `MACOS_NOTARIZE_PASSWORD`, `MACOS_TEAM_ID`
+instead of the API key). Then set the repository variable
+`REQUIRE_NOTARIZATION=true` so a release can't ship without it.
+
+To build locally: `scripts/dist/package-macos.sh`, `package-linux.sh` (on
+Linux) or `package-windows.sh` (Git Bash on Windows); files land in `dist/`.
+
+## License
+
+MIT; see [LICENSE](LICENSE). Parts of the protocol code and the release
+tooling come from [IRIS](https://github.com/techomancer/iris) and remain under
+its BSD 3-Clause license; see [LICENSE-iris.txt](LICENSE-iris.txt).

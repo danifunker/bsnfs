@@ -515,8 +515,11 @@ fn admin_api_lists_and_changes_exports() {
     let s = start(&root);
     let admin = s.ports.admin.unwrap();
 
-    let (st, page) = http(admin, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    let (st, page) = http(admin, "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
     assert_eq!(st, 200);
+    // DNS rebinding: a foreign site's name pointed at us gets nothing.
+    let (st, _) = http(admin, "GET /api/status HTTP/1.1\r\nHost: evil.example.com\r\n\r\n");
+    assert_eq!(st, 403);
     assert!(page.contains("<title>bsnfs</title>"));
 
     let (st, body) = http(admin, "GET /api/status HTTP/1.1\r\nHost: nas.local:8080\r\n\r\n");
@@ -526,7 +529,7 @@ fn admin_api_lists_and_changes_exports() {
 
     let form = format!("name=extra&path={}", extra.display().to_string().replace('/', "%2F"));
     let post = |headers: &str| {
-        format!("POST /api/exports/add HTTP/1.1\r\nHost: x\r\n{headers}Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{form}", form.len())
+        format!("POST /api/exports/add HTTP/1.1\r\nHost: localhost\r\n{headers}Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{form}", form.len())
     };
     let (st, _) = http(admin, &post(""));
     assert_eq!(st, 403, "mutations need the X-Requested-With header");

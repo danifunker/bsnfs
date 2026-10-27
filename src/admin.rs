@@ -18,7 +18,6 @@ const PAGE: &str = include_str!("admin.html");
 const MAX_BODY: usize = 64 * 1024;
 
 pub fn spawn(listener: TcpListener, server: Arc<Server>) -> io::Result<()> {
-    info!("admin UI on http://{}/", listener.local_addr()?);
     std::thread::Builder::new().name("admin".into()).spawn(move || {
         for stream in listener.incoming().flatten() {
             let server = server.clone();
@@ -126,6 +125,12 @@ fn read_request(r: &mut impl BufRead) -> io::Result<Option<Request>> {
 }
 
 fn route(req: &Request, server: &Server) -> Response {
+    if !host_allowed(req.headers.get("host").map(String::as_str), &server.cfg.admin_hosts) {
+        return Response::error(
+            403,
+            "unexpected Host name: open this page by IP address, localhost or this machine's name (or allow the name with --admin-host)",
+        );
+    }
     if let Some(pw) = &server.cfg.admin_password
         && !authorized(req, pw) {
             let mut r = Response::error(401, "password required");
@@ -140,7 +145,7 @@ fn route(req: &Request, server: &Server) -> Response {
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => Response { status: 200, content_type: "text/html; charset=utf-8", body: PAGE.as_bytes().to_vec(), extra: Vec::new() },
         ("GET", "/api/status") => Response::json(200, status_json(req, server)),
-        ("GET", "/api/browse") => browse(req.query.get("path").map(String::as_str)),
+        ("GET", "/api/browse") => browse(req.query.get("path").map(String::as_str), &server.cfg.share_roots),
         ("POST", "/api/exports/add") => add_export(server, &form),
         ("POST", "/api/exports/remove") => change_export(server, &form, |s, id| {
             let name = s.vfs.exports().into_iter().find(|(i, _)| *i == id).map(|(_, e)| e.name.clone());
@@ -156,6 +161,45 @@ fn route(req: &Request, server: &Server) -> Response {
         }
         _ => Response::error(404, "not found"),
     }
+}
+
+/// Whether the `Host` header names this machine. Without this check, a web
+/// page on any site could point its own domain at 127.0.0.1 (DNS
+/// rebinding) and drive this API from the visitor's browser.
+fn host_allowed(host: Option<&str>, extra: &[String]) -> bool {
+    let Some(host) = host else { return true }; // HTTP/1.0: no name to rebind
+    let host = strip_port(host).trim_end_matches('.').to_ascii_lowercase();
+    if host.parse::<std::net::IpAddr>().is_ok() || host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
+        return true;
+    }
+    if extra.iter().any(|h| h.eq_ignore_ascii_case(&host)) {
+        return true;
+    }
+    let me = machine_name().to_ascii_lowercase();
+    !me.is_empty() && (host == me || host.split('.').next() == me.split('.').next())
+}
+
+fn machine_name() -> String {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        // SAFETY: gethostname writes at most buf.len() bytes.
+        if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0 {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            return String::from_utf8_lossy(&buf[..end]).into_owned();
+        }
+        String::new()
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::var("COMPUTERNAME").unwrap_or_default()
+    }
+}
+
+/// Whether `path` lies inside one of the allowed share roots (all of the
+/// filesystem when none are configured).
+fn within_roots(path: &std::path::Path, roots: &[PathBuf]) -> bool {
+    roots.is_empty() || roots.iter().any(|r| path.starts_with(r))
 }
 
 fn authorized(req: &Request, password: &str) -> bool {
@@ -178,6 +222,11 @@ fn add_export(server: &Server, form: &HashMap<String, String>) -> Response {
         Ok(s) => s,
         Err(e) => return Response::error(400, &e),
     };
+    match std::fs::canonicalize(&spec.path) {
+        Ok(p) if within_roots(&p, &server.cfg.share_roots) => {}
+        Ok(p) => return Response::error(403, &format!("{} is outside the folders this server may share", p.display())),
+        Err(e) => return Response::error(400, &format!("{}: {e}", spec.path.display())),
+    }
     let read_only = form.get("read_only").map(|v| v == "1" || v == "true").unwrap_or(false);
     let _guard = server.exports_lock.lock().unwrap();
     match server.vfs.add_export(&spec.name, &spec.path, read_only) {
@@ -209,13 +258,16 @@ fn saved(server: &Server, id: usize) -> Response {
 }
 
 /// List the subdirectories of `path`, to help pick a folder to share.
-fn browse(path: Option<&str>) -> Response {
+/// Confined to the share roots, when there are any.
+fn browse(path: Option<&str>, roots: &[PathBuf]) -> Response {
+    let home = || std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from);
     let path = match path.filter(|p| !p.is_empty()) {
         Some(p) => PathBuf::from(p),
-        None => std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| "/".into()),
+        None => roots.first().cloned().or_else(home).unwrap_or_else(|| "/".into()),
     };
     let path = match std::fs::canonicalize(&path) {
-        Ok(p) => p,
+        Ok(p) if within_roots(&p, roots) => p,
+        Ok(p) => return Response::error(403, &format!("{} is outside the folders this server may share", p.display())),
         Err(e) => return Response::error(400, &format!("{}: {e}", path.display())),
     };
     let mut dirs: Vec<String> = match std::fs::read_dir(&path) {
@@ -228,7 +280,11 @@ fn browse(path: Option<&str>) -> Response {
         Err(e) => return Response::error(400, &format!("{}: {e}", path.display())),
     };
     dirs.sort_by_key(|d| d.to_lowercase());
-    let parent = path.parent().map(|p| js(&p.to_string_lossy())).unwrap_or_else(|| "null".into());
+    let parent = path
+        .parent()
+        .filter(|p| within_roots(p, roots))
+        .map(|p| js(&p.to_string_lossy()))
+        .unwrap_or_else(|| "null".into());
     let list: Vec<String> = dirs.iter().map(|d| js(d)).collect();
     Response::json(200, format!("{{\"path\":{},\"parent\":{parent},\"dirs\":[{}]}}", js(&path.to_string_lossy()), list.join(",")))
 }
@@ -307,7 +363,7 @@ fn status_json(req: &Request, server: &Server) -> String {
             "\"exports\":[{}],\"mounts\":[{}],\"clients\":[{}],",
             "\"calls\":{},\"per_call\":{{{}}},\"recent\":[{}]}}"
         ),
-        js(env!("CARGO_PKG_VERSION")),
+        js(crate::VERSION),
         ago(stats.started),
         js(&host),
         js(&server.cfg.bind.to_string()),
@@ -432,5 +488,30 @@ mod tests {
         assert_eq!(js("a\"b</script>"), "\"a\\\"b\\u003c/script>\"");
         assert_eq!(strip_port("host:8080"), "host");
         assert_eq!(strip_port("[::1]:8080"), "::1");
+    }
+
+    #[test]
+    fn host_header_check_stops_dns_rebinding() {
+        assert!(host_allowed(Some("127.0.0.1:8080"), &[]));
+        assert!(host_allowed(Some("[::1]:8080"), &[]));
+        assert!(host_allowed(Some("localhost:8080"), &[]));
+        assert!(host_allowed(Some("192.168.1.20:8080"), &[]));
+        assert!(host_allowed(Some("nas.local"), &[]));
+        assert!(host_allowed(None, &[]));
+        assert!(!host_allowed(Some("evil.example.com:8080"), &[]));
+        assert!(host_allowed(Some("nas.home.arpa"), &["nas.home.arpa".to_string()]));
+        let me = machine_name();
+        if !me.is_empty() {
+            assert!(host_allowed(Some(&format!("{me}:8080")), &[]));
+        }
+    }
+
+    #[test]
+    fn share_roots_confine_the_admin_page() {
+        let roots = [PathBuf::from("/srv/nfs")];
+        assert!(within_roots(std::path::Path::new("/srv/nfs/irix"), &roots));
+        assert!(!within_roots(std::path::Path::new("/srv/nfsx"), &roots));
+        assert!(!within_roots(std::path::Path::new("/etc"), &roots));
+        assert!(within_roots(std::path::Path::new("/etc"), &[]));
     }
 }

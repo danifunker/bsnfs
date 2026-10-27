@@ -1,0 +1,88 @@
+# Release build: pushing a tag vX.Y.Z builds that commit and publishes it as
+# release X.Y.Z, marked as the latest release.
+#
+#   git tag v1.2.3 && git push origin v1.2.3
+#
+# Re-running for a tag that already has a release replaces that release. To do
+# that without pushing anything, use Actions > Release > Run workflow and name
+# the tag.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re)build and publish, e.g. v1.2.3
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      sha: ${{ steps.v.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - id: v
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          VERSION=$(scripts/dist/version.sh release "$TAG")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    uses: ./.github/workflows/build.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      ref: ${{ needs.prepare.outputs.sha }}
+      # Once the signing secrets exist, set the repository variable
+      # REQUIRE_NOTARIZATION=true so a release can't ship an unnotarized binary.
+      require_notarization: ${{ vars.REQUIRE_NOTARIZATION == 'true' }}
+
+  publish:
+    name: Publish
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Release notes
+        run: >
+          scripts/dist/release-notes.sh --channel release
+          --version "${{ needs.prepare.outputs.version }}"
+          --tag "${{ needs.prepare.outputs.tag }}"
+          -o "$RUNNER_TEMP/notes.md"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          scripts/dist/publish-github.sh
+          --tag "${{ needs.prepare.outputs.tag }}"
+          --sha "${{ needs.prepare.outputs.sha }}"
+          --title "bsnfs ${{ needs.prepare.outputs.version }}"
+          --notes "$RUNNER_TEMP/notes.md" --dir dist

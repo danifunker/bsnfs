@@ -1,0 +1,230 @@
+# Build every distribution file on every platform.
+#
+# Each job installs a toolchain, then calls one script in scripts/dist/. The
+# scripts do the building and packaging, so running one by hand gives you the
+# same files.
+#
+# Called by nightly.yml and release.yml, which then publish what this leaves
+# behind as workflow artifacts. Run it by hand (Actions > Build > Run workflow)
+# to check that a branch builds everywhere without publishing anything.
+
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version to stamp into the binary and file names
+        type: string
+        required: true
+      ref:
+        description: Commit to build
+        type: string
+        required: true
+      require_notarization:
+        description: Fail the macOS job instead of shipping an unnotarized binary
+        type: boolean
+        default: false
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      ref: ${{ steps.v.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - id: v
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          [ -n "$VERSION" ] || VERSION=$(scripts/dist/version.sh dev)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Building \`$VERSION\` from \`$(git rev-parse --short HEAD)\`" >> "$GITHUB_STEP_SUMMARY"
+
+  linux:
+    name: Linux (${{ matrix.arch }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   target: x86_64-unknown-linux-musl,  runner: ubuntu-24.04 }
+          - { arch: arm64, target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - name: Toolchain and packagers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools rpm zstd file
+          rustup toolchain install stable --profile minimal && rustup default stable
+          rustup target add ${{ matrix.target }}
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: dist-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}
+          restore-keys: dist-${{ matrix.target }}-
+      - name: Build and package
+        run: scripts/dist/package-linux.sh --target ${{ matrix.target }} --version "${{ needs.version.outputs.version }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    name: macOS (universal)
+    needs: version
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal && rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: dist-macos-${{ hashFiles('Cargo.toml') }}
+          restore-keys: dist-macos-
+
+      # Signing and notarization switch on when the secrets exist. Without
+      # them the binary is signed ad hoc and Gatekeeper warns on first run.
+      - name: Import the Developer ID certificate
+        id: signing
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          if [ -z "$MACOS_CERTIFICATE" ]; then
+            echo "::warning::MACOS_CERTIFICATE is not set: the macOS build is signed ad hoc and not notarized."
+            echo "identity=-" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PWD=$(openssl rand -base64 32)
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          rm "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PWD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          ID=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+               | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ -z "$ID" ]; then
+            echo "::error::MACOS_CERTIFICATE holds no 'Developer ID Application' identity (certificate plus private key)."
+            exit 1
+          fi
+          echo "identity=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: Write the notarization key
+        env:
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: |
+          if [ -n "$APP_STORE_CONNECT_PRIVATE_KEY" ]; then
+            echo "$APP_STORE_CONNECT_PRIVATE_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          fi
+
+      - name: Build, sign, notarize and package
+        env:
+          MACOS_SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+          NOTARY_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          NOTARY_KEY_PATH: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY != '' && format('{0}/notary.p8', runner.temp) || '' }}
+          NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARIZE_APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARIZE_PASSWORD }}
+          NOTARY_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          REQUIRE_NOTARIZATION: ${{ inputs.require_notarization && '1' || '0' }}
+        run: scripts/dist/package-macos.sh --version "${{ needs.version.outputs.version }}"
+
+      - name: Remove the signing keychain and key
+        if: always()
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          [ -f "$KEYCHAIN" ] && security delete-keychain "$KEYCHAIN" || true
+          rm -f "$RUNNER_TEMP/notary.p8"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-macos-universal
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    name: Windows (${{ matrix.arch }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   target: x86_64-pc-windows-msvc,  runner: windows-latest }
+          - { arch: arm64, target: aarch64-pc-windows-msvc, runner: windows-11-arm }
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - name: Toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal && rustup default stable
+          rustup target add ${{ matrix.target }}
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: dist-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}
+          restore-keys: dist-${{ matrix.target }}-
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+      - name: Build and package
+        shell: bash
+        run: scripts/dist/package-windows.sh --target ${{ matrix.target }} --version "${{ needs.version.outputs.version }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-windows-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Everything the downloads table links to must exist before anyone publishes.
+  check:
+    name: Check the release files
+    needs: [version, linux, macos, windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - run: ls -lh dist
+      - run: scripts/dist/release-notes.sh --version "${{ needs.version.outputs.version }}" --check dist
