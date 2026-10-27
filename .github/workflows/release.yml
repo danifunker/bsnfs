@@ -1,30 +1,30 @@
-# Release build: pushing a tag vX.Y.Z builds that commit and publishes it as
-# release X.Y.Z, marked as the latest release.
+# Release on every push to main: build everything, then publish it as release
+# YYYY.MM.DD.HHMMSS (the commit's UTC time), tagged vYYYY.MM.DD.HHMMSS and
+# marked as the latest release. The notes list the commits since the previous
+# release.
 #
-#   git tag v1.2.3 && git push origin v1.2.3
-#
-# Re-running for a tag that already has a release replaces that release. To do
-# that without pushing anything, use Actions > Release > Run workflow and name
-# the tag.
+# Run it by hand (Actions > Release > Run workflow) to rebuild and republish
+# the current main; the version stays the same, so that release is replaced.
 
 name: Release
 
 on:
   push:
-    tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
+    branches: [main]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing tag to (re)build and publish, e.g. v1.2.3
-        required: true
 
 permissions:
   contents: write
 
+# One release at a time, in push order. GitHub keeps only the newest waiting
+# run, so a burst of pushes releases the last one.
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}
+  group: release
   cancel-in-progress: false
+
+env:
+  # Run every JavaScript action on Node 24.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   prepare:
@@ -34,18 +34,23 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
       sha: ${{ steps.v.outputs.sha }}
+      previous: ${{ steps.v.outputs.previous }}
     steps:
       - uses: actions/checkout@v5
-        with:
-          ref: ${{ inputs.tag || github.ref }}
       - id: v
         env:
-          TAG: ${{ inputs.tag || github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION=$(scripts/dist/version.sh release "$TAG")
+          VERSION=$(scripts/dist/version.sh timestamp)
+          PREVIOUS=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "previous=$PREVIOUS" >> "$GITHUB_OUTPUT"
+          echo "Releasing \`$VERSION\` from \`$(git rev-parse --short HEAD)\` (previous: ${PREVIOUS:-none})" >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    uses: ./.github/workflows/ci.yml
 
   build:
     needs: prepare
@@ -60,7 +65,7 @@ jobs:
 
   publish:
     name: Publish
-    needs: [prepare, build]
+    needs: [prepare, test, build]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -76,13 +81,16 @@ jobs:
           scripts/dist/release-notes.sh --channel release
           --version "${{ needs.prepare.outputs.version }}"
           --tag "${{ needs.prepare.outputs.tag }}"
+          --commit "${{ needs.prepare.outputs.sha }}"
           -o "$RUNNER_TEMP/notes.md"
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          PREVIOUS: ${{ needs.prepare.outputs.previous }}
         run: >
           scripts/dist/publish-github.sh
-          --tag "${{ needs.prepare.outputs.tag }}"
+          --tag "${{ needs.prepare.outputs.tag }}" --move-tag
           --sha "${{ needs.prepare.outputs.sha }}"
           --title "bsnfs ${{ needs.prepare.outputs.version }}"
           --notes "$RUNNER_TEMP/notes.md" --dir dist
+          ${PREVIOUS:+--previous "$PREVIOUS"}

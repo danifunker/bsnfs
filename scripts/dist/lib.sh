@@ -1,7 +1,7 @@
 # shellcheck shell=bash disable=SC2034
 # Shared helpers for the scripts in scripts/dist/. Sourced, never run.
 #
-# Every distribution build (nightly, tagged release, or a local build) goes
+# Every distribution build (each release from main, or a local build) goes
 # through these scripts. The GitHub workflows only install toolchains, call a
 # script, and upload what it left in dist/, so anything CI builds you can
 # build the same way locally.

@@ -69,6 +69,7 @@ fn serve(d: &Arc<Dispatcher>, socks: (Option<UdpSocket>, Option<TcpListener>, u1
 pub fn start(cfg: Config) -> io::Result<Arc<Server>> {
     let vfs = Arc::new(Vfs::new(cfg.exports.iter().map(|e| (e.name.clone(), e.path.clone(), e.read_only)).collect())?);
     vfs.set_symlinks(cfg.symlinks);
+    vfs.set_emulate_symlinks(cfg.emulate_symlinks);
     let mount = Arc::new(Mount::new(vfs.clone()));
     let pmap = Arc::new(Portmap::new(Vec::new()));
     let mut programs: Vec<Arc<dyn Program>> =

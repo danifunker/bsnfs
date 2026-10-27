@@ -1,16 +1,22 @@
-# Build, lint and test on every push and pull request, on all three host
-# platforms. Linux also checks the static (musl) release build compiles.
+# Build, lint and test on all three host platforms. Linux also checks the
+# static (musl) release build compiles.
+#
+# Runs for pull requests and pushes to other branches. On main, release.yml
+# runs it before publishing, so a release never ships failing tests.
 
 name: CI
 
 on:
   push:
-    branches: [main]
+    branches-ignore: [main]
   pull_request:
     branches: [main]
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
+  # Run every JavaScript action on Node 24.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   test:

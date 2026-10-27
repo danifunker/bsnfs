@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
 # Build and package bsnfs for Linux as a static (musl) binary, so one build
-# runs on every distribution: a tarball, plus deb, rpm and Arch packages that
-# install the systemd service (not enabled; see installer/linux/postinst).
+# runs on every distribution: a tarball, deb, rpm and Arch packages that
+# install the systemd service (not enabled; see installer/linux/postinst),
+# and an AppImage.
 #
-#   scripts/dist/package-linux.sh [options] [--formats tar,deb,rpm,pkg]
+#   scripts/dist/package-linux.sh [options] [--formats tar,deb,rpm,pkg,appimage]
 #
 # --target defaults to the host's architecture with musl, e.g.
-# x86_64-unknown-linux-musl. Build on a host of the target's architecture:
-# packaging runs the new binary to write its starter config.
+# x86_64-unknown-linux-musl. For another architecture (riscv64 from x86_64)
+# the script cross-links with <triple>-gcc, strips with <triple>-strip, and
+# runs the new binary under qemu-<arch>-static (it runs the binary to write
+# its starter config).
 #
-# Needs: musl-tools (musl-gcc), dpkg-deb, rpmbuild, zstd.
+# Needs: musl-tools, dpkg-deb, rpmbuild, zstd, file, curl; for a cross build
+# also gcc-<triple> and qemu-user-static.
 source "$(dirname "$0")/lib.sh"
 
-FORMATS="tar,deb,rpm,pkg"
+FORMATS="tar,deb,rpm,pkg,appimage"
 parse_common_args "$@"
 set -- ${REST[@]+"${REST[@]}"}
 while [ $# -gt 0 ]; do
@@ -27,17 +31,29 @@ case "$TARGET" in
     *-linux-gnu) TARGET="${TARGET%-gnu}-musl" ;;
 esac
 case "$TARGET" in
-    x86_64-unknown-linux-musl)  ARCH=x64;   DEB_ARCH=amd64; PKG_ARCH=x86_64 ;;
-    aarch64-unknown-linux-musl) ARCH=arm64; DEB_ARCH=arm64; PKG_ARCH=aarch64 ;;
-    *) die "unsupported Linux target $TARGET (want x86_64 or aarch64 -unknown-linux-musl)" ;;
+    x86_64-unknown-linux-musl)    ARCH=x64;     DEB_ARCH=amd64;   PKG_ARCH=x86_64;  GNU=x86_64-linux-gnu ;;
+    aarch64-unknown-linux-musl)   ARCH=arm64;   DEB_ARCH=arm64;   PKG_ARCH=aarch64; GNU=aarch64-linux-gnu ;;
+    riscv64gc-unknown-linux-musl) ARCH=riscv64; DEB_ARCH=riscv64; PKG_ARCH=riscv64; GNU=riscv64-linux-gnu ;;
+    *) die "unsupported Linux target $TARGET (want x86_64, aarch64 or riscv64gc -unknown-linux-musl)" ;;
 esac
+
+# Cross build: link, strip and run with the target's tools.
+STRIP=strip
+RUN=()
+if [ "$(uname -m)" != "$PKG_ARCH" ]; then
+    need "$GNU-gcc" "$GNU-strip" "qemu-$PKG_ARCH-static"
+    var="CARGO_TARGET_$(echo "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER"
+    export "$var=$GNU-gcc"
+    STRIP="$GNU-strip"
+    RUN=("qemu-$PKG_ARCH-static")
+fi
 
 build "$TARGET"
 BIN="$(release_dir "$TARGET")/bsnfs"
 [ -x "$BIN" ] || die "$BIN was not built"
-strip "$BIN"
-file "$BIN" 2>/dev/null | grep -q "statically linked\|static-pie" || warn "$BIN does not look statically linked"
-"$BIN" --version
+"$STRIP" "$BIN"
+file "$BIN" 2>/dev/null | grep -q "statically linked\|static-pie" || die "$BIN is not statically linked"
+${RUN[@]+"${RUN[@]}"} "$BIN" --version
 
 PKGVER=$(pkg_version "$VERSION")
 BASE="bsnfs-linux-${ARCH}-${VERSION}"
@@ -49,7 +65,7 @@ stage_tree() {  # <dir>
     install -Dm644 installer/linux/bsnfs.service "$1/usr/lib/systemd/system/bsnfs.service"
     install -Dm644 installer/linux/sysusers.conf "$1/usr/lib/sysusers.d/bsnfs.conf"
     install -d "$1/etc/bsnfs"
-    "$BIN" service starter-config > "$1/etc/bsnfs/bsnfs.conf"
+    ${RUN[@]+"${RUN[@]}"} "$BIN" service starter-config > "$1/etc/bsnfs/bsnfs.conf"
     chmod 0640 "$1/etc/bsnfs/bsnfs.conf"
     for f in "${DOC_FILES[@]}"; do install -Dm644 "$f" "$1/usr/share/doc/bsnfs/$f"; done
 }
@@ -135,7 +151,8 @@ $PRERM
 %config(noreplace) /etc/bsnfs/bsnfs.conf
 %doc /usr/share/doc/bsnfs
 SPEC
-    rpmbuild --quiet --define "_topdir $S/top" --define "_build_id_links none" --target "$PKG_ARCH" -bb "$S/bsnfs.spec"
+    rpmbuild --quiet --define "_topdir $S/top" --define "_build_id_links none" \
+        --define "_binaries_in_noarch_packages_terminate_build 0" --target "$PKG_ARCH-linux" -bb "$S/bsnfs.spec"
     mv "$S"/top/RPMS/*/*.rpm "$OUT_DIR/$BASE.rpm"
     rm -rf "$S"
     rpm -qp --qf '%{NAME} %{VERSION} %{ARCH}\n' "$OUT_DIR/$BASE.rpm"
@@ -173,6 +190,43 @@ backup = etc/bsnfs/bsnfs.conf
 PKGINFO
     (cd "$S" && tar --zstd -cf "$OUT_DIR/$BASE.pkg.tar.zst" .PKGINFO .INSTALL usr etc)
     rm -rf "$S"
+    group_end
+fi
+
+if has_format appimage; then
+    group_start "AppImage"
+    need curl
+    case "$PKG_ARCH" in
+        x86_64|aarch64) ;;
+        *) die "appimagetool has no $PKG_ARCH build; leave appimage out of --formats" ;;
+    esac
+    S=$(stage_dir)
+    A="$S/bsnfs.AppDir"
+    install -Dm755 "$BIN" "$A/usr/bin/bsnfs"
+    for f in "${DOC_FILES[@]}"; do install -Dm644 "$f" "$A/usr/share/doc/bsnfs/$f"; done
+    install -Dm644 installer/linux/bsnfs.png "$A/bsnfs.png"
+    install -Dm644 installer/linux/bsnfs.png "$A/usr/share/icons/hicolor/256x256/apps/bsnfs.png"
+    cat > "$A/bsnfs.desktop" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=bsnfs
+Comment=Share a folder with old and new NFS clients
+Exec=bsnfs
+Icon=bsnfs
+Terminal=true
+Categories=Network;FileTransfer;
+DESKTOP
+    printf '#!/bin/sh\nexec "$(dirname "$(readlink -f "$0")")/usr/bin/bsnfs" "$@"\n' > "$A/AppRun"
+    chmod 755 "$A/AppRun"
+    # appimagetool for the host; it fetches the runtime for $ARCH itself.
+    TOOL="$S/appimagetool"
+    curl -fsSL --retry 5 -o "$TOOL" \
+        "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$(uname -m).AppImage"
+    chmod +x "$TOOL"
+    APPIMAGE="$OUT_DIR/$BASE.AppImage"
+    ARCH="$PKG_ARCH" APPIMAGE_EXTRACT_AND_RUN=1 "$TOOL" --no-appstream "$A" "$APPIMAGE"
+    rm -rf "$S"
+    APPIMAGE_EXTRACT_AND_RUN=1 ${RUN[@]+"${RUN[@]}"} "$APPIMAGE" --version
     group_end
 fi
 

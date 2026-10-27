@@ -41,6 +41,9 @@ Options:
       --share-root DIR     the admin UI may only share (and browse) folders
                            inside DIR; repeatable
       --no-symlinks        refuse client requests to create symlinks
+      --emulate-symlinks   store client symlinks as `symlink-NAME` files, for
+                           disks that can't hold real ones (FAT, exFAT);
+                           always on for Windows hosts
   -c, --exports-file FILE  load exports from FILE and save admin UI changes
                            to it
       --log-file FILE      write the log to FILE instead of the terminal
@@ -61,7 +64,7 @@ Options on the command line override the file.
 
 /// Options that take no value. In a config file they may be followed by
 /// yes/no (or true/false, on/off).
-const FLAGS: &[&str] = &["no-udp", "no-tcp", "no-nlm", "read-only", "no-admin", "no-symlinks", "verbose", "quiet"];
+const FLAGS: &[&str] = &["no-udp", "no-tcp", "no-nlm", "read-only", "no-admin", "no-symlinks", "emulate-symlinks", "verbose", "quiet"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortmapMode {
@@ -97,6 +100,7 @@ pub struct Config {
     pub admin_hosts: Vec<String>,
     pub share_roots: Vec<PathBuf>,
     pub symlinks: bool,
+    pub emulate_symlinks: bool,
     pub log_file: Option<PathBuf>,
     pub verbosity: u8,
 }
@@ -121,6 +125,7 @@ impl Default for Config {
             admin_hosts: Vec::new(),
             share_roots: Vec::new(),
             symlinks: true,
+            emulate_symlinks: false,
             log_file: None,
             verbosity: 1,
         }
@@ -256,6 +261,7 @@ fn parse_args(args: Vec<String>) -> Result<Parsed, String> {
                 cfg.share_roots.push(canon);
             }
             "--no-symlinks" => cfg.symlinks = false,
+            "--emulate-symlinks" => cfg.emulate_symlinks = true,
             "-c" | "--exports-file" => cfg.exports_file = Some(PathBuf::from(value(&flag)?)),
             "-v" | "--verbose" => cfg.verbosity += 1,
             "-vv" => cfg.verbosity += 2,

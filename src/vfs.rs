@@ -354,11 +354,6 @@ struct Node {
     md: Meta,
 }
 
-impl Node {
-    fn lstat(&self, rel: &Path) -> Result<Meta> {
-        Ok(confine::lstat(&self.export.root, rel)?)
-    }
-}
 
 const LISTING_CACHE: usize = 64;
 
@@ -372,7 +367,18 @@ pub struct Vfs {
     /// Whether clients may create symlinks. They are never followed here,
     /// but other programs on the host would follow them.
     symlinks: AtomicBool,
+    /// Store client symlinks as `symlink-NAME` files (see [`LINK_PREFIX`]).
+    emulate: AtomicBool,
 }
+
+/// Emulated symlinks: a client's symlink `NAME` is stored on the host as an
+/// ordinary file `symlink-NAME` holding [`LINK_MAGIC`] and the target. Used
+/// where the host can't hold real symlinks (Windows, FAT/exFAT disks). A file
+/// only counts as one if its contents start with the magic line, so a real
+/// file that happens to be called `symlink-...` stays a file.
+const LINK_PREFIX: &[u8] = b"symlink-";
+const LINK_MAGIC: &[u8] = b"!<bsnfs-symlink>\n";
+const LINK_MAX: u64 = 4096;
 
 impl Vfs {
     /// `exports` is `(name, host path, read_only)`.
@@ -384,6 +390,7 @@ impl Vfs {
             generation,
             listings: Mutex::new(HashMap::new()),
             symlinks: AtomicBool::new(true),
+            emulate: AtomicBool::new(cfg!(windows)),
         };
         for (name, path, read_only) in exports {
             vfs.add_export(&name, &path, read_only)?;
@@ -428,6 +435,60 @@ impl Vfs {
     /// Allow or refuse client requests to create symlinks.
     pub fn set_symlinks(&self, allow: bool) {
         self.symlinks.store(allow, Ordering::Relaxed);
+    }
+
+    /// Store client symlinks as `symlink-NAME` files. Always on for Windows
+    /// hosts, which can't hold real ones.
+    pub fn set_emulate_symlinks(&self, on: bool) {
+        self.emulate.store(on || cfg!(windows), Ordering::Relaxed);
+    }
+
+    fn emulating(&self) -> bool {
+        self.emulate.load(Ordering::Relaxed)
+    }
+
+    /// Host attributes of `rel`, with emulated symlinks reported as symlinks.
+    fn stat(&self, export: &Export, rel: &Path) -> io::Result<Meta> {
+        let md = confine::lstat(&export.root, rel)?;
+        Ok(self.classify(export, rel, md))
+    }
+
+    fn classify(&self, export: &Export, rel: &Path, md: Meta) -> Meta {
+        let named = rel.file_name().is_some_and(|n| {
+            let n = name_bytes(n.to_os_string());
+            n.len() > LINK_PREFIX.len() && n.starts_with(LINK_PREFIX)
+        });
+        let sized = (LINK_MAGIC.len() as u64..=LINK_MAGIC.len() as u64 + LINK_MAX).contains(&md.size);
+        if md.kind == Type::File && named && sized && self.emulating()
+            && let Some(target) = read_emulated(&export.root, rel)
+        {
+            return Meta { kind: Type::Symlink, size: target.len() as u64, ..md };
+        }
+        md
+    }
+
+    /// Whether the symlink at `rel` is an emulated one (a file on the host).
+    fn is_emulated(export: &Export, rel: &Path) -> bool {
+        confine::lstat(&export.root, rel).is_ok_and(|m| m.kind == Type::File)
+    }
+
+    /// Where the client's `name` in `dir_rel` lives on the host, and what's
+    /// there: `dir/name` itself, else an emulated link `dir/symlink-name`.
+    fn host_entry(&self, export: &Export, dir_rel: &Path, name: &[u8]) -> Result<(PathBuf, Option<Meta>)> {
+        let rel = dir_rel.join(component(name)?);
+        match self.stat(export, &rel) {
+            Ok(m) => return Ok((rel, Some(m))),
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+            Err(_) => {}
+        }
+        if self.emulating()
+            && let Ok(lrel) = link_rel(dir_rel, name)
+            && let Ok(m) = self.stat(export, &lrel)
+            && m.kind == Type::Symlink
+        {
+            return Ok((lrel, Some(m)));
+        }
+        Ok((rel, None))
     }
 
     /// Stop sharing an export. Clients holding its handles get STALE.
@@ -542,7 +603,7 @@ impl Vfs {
         let export = self.export(h)?;
         let rel = export.rel(h.id)?;
         // Gone from the host since we handed out the handle: stale.
-        let md = confine::lstat(&export.root, &rel).map_err(|_| Error::Stale)?;
+        let md = self.stat(&export, &rel).map_err(|_| Error::Stale)?;
         Ok(Node { export, rel, md })
     }
 
@@ -567,12 +628,17 @@ impl Vfs {
     /// is clamped at the export root so it can never leave the share.
     pub fn lookup(&self, dir: &Handle, name: &[u8]) -> Result<(Handle, Attr)> {
         let node = self.resolve_dir(dir)?;
-        let rel = match name {
-            b"." => node.rel.clone(),
-            b".." => node.rel.parent().map(Path::to_path_buf).unwrap_or_default(),
-            _ => node.rel.join(component(name)?),
+        let (rel, md) = match name {
+            b"." | b".." => {
+                let rel = if name == b"." { node.rel.clone() } else { node.rel.parent().map(Path::to_path_buf).unwrap_or_default() };
+                let md = self.stat(&node.export, &rel)?;
+                (rel, md)
+            }
+            _ => match self.host_entry(&node.export, &node.rel, name)? {
+                (rel, Some(md)) => (rel, md),
+                (_, None) => return Err(Error::NoEnt),
+            },
         };
-        let md = node.lstat(&rel)?;
         let id = node.export.intern(&rel);
         Ok((Handle { export: dir.export, id }, node.export.attr(id, &rel, &md)))
     }
@@ -581,6 +647,9 @@ impl Vfs {
         let node = self.resolve(h)?;
         if node.md.kind != Type::Symlink {
             return Err(Error::Inval);
+        }
+        if Self::is_emulated(&node.export, &node.rel) {
+            return read_emulated(&node.export.root, &node.rel).ok_or(Error::Stale);
         }
         Ok(confine::read_link(&node.export.root, &node.rel)?)
     }
@@ -601,16 +670,24 @@ impl Vfs {
         let mut entries = Vec::new();
         let parent = node.rel.parent().map(Path::to_path_buf).unwrap_or_default();
         for (name, rel) in [(&b"."[..], &node.rel), (&b".."[..], &parent)] {
-            if let Ok(md) = node.lstat(rel) {
+            if let Ok(md) = self.stat(export, rel) {
                 entries.push(entry(name.to_vec(), rel, &md));
             }
         }
+        let raw = confine::read_dir(&export.root, &node.rel)?;
+        let host_names: std::collections::HashSet<Vec<u8>> = raw.iter().map(|(n, _)| name_bytes(n.clone())).collect();
         let mut children = Vec::new();
-        for (os_name, md) in confine::read_dir(&export.root, &node.rel)? {
-            let name = name_bytes(os_name.clone());
+        for (os_name, md) in raw {
+            let mut name = name_bytes(os_name.clone());
             // Skip anything that wouldn't round-trip as a safe component.
             if component(&name).is_err() {
                 continue;
+            }
+            let md = self.classify(export, &node.rel.join(&os_name), md);
+            // An emulated link shows under its own name, unless a real entry
+            // already has that name.
+            if md.kind == Type::Symlink && name.starts_with(LINK_PREFIX) && !host_names.contains(&name[LINK_PREFIX.len()..]) {
+                name.drain(..LINK_PREFIX.len());
             }
             children.push((name, os_name, md));
         }
@@ -638,7 +715,12 @@ impl Vfs {
     // ── file data ───────────────────────────────────────────────────────────
 
     fn open_file(node: &Node, write: bool) -> Result<File> {
-        Ok(confine::open_file(&node.export.root, &node.rel, write, None)?)
+        match node.md.kind {
+            Type::Dir => Err(Error::IsDir),
+            Type::File => Ok(confine::open_file(&node.export.root, &node.rel, write, None)?),
+            // Symlinks (real or emulated) are never opened through.
+            _ => Err(Error::Inval),
+        }
     }
 
     /// Read up to `count` bytes at `offset`. Returns the data and whether it
@@ -702,25 +784,26 @@ impl Vfs {
 
     // ── namespace changes ───────────────────────────────────────────────────
 
-    /// Resolve a writable directory and the export-relative path of `name`.
-    fn child(&self, dir: &Handle, name: &[u8]) -> Result<(Arc<Export>, PathBuf)> {
+    /// Resolve a writable directory, and where `name` in it lives on the
+    /// host and what's there now.
+    fn child(&self, dir: &Handle, name: &[u8]) -> Result<(Arc<Export>, PathBuf, PathBuf, Option<Meta>)> {
         let node = self.resolve_dir(dir)?;
         writable(&node.export)?;
-        let rel = node.rel.join(component(name)?);
-        Ok((node.export, rel))
+        let (rel, md) = self.host_entry(&node.export, &node.rel, name)?;
+        Ok((node.export, node.rel, rel, md))
     }
 
     /// Intern a newly created object and return its handle and attributes.
     fn created(&self, dir: &Handle, export: &Export, rel: &Path) -> Result<(Handle, Attr)> {
-        let md = confine::lstat(&export.root, rel)?;
+        let md = self.stat(export, rel)?;
         let id = export.intern(rel);
         Ok((Handle { export: dir.export, id }, export.attr(id, rel, &md)))
     }
 
     pub fn create(&self, dir: &Handle, name: &[u8], how: CreateMode, sa: &SetAttr) -> Result<(Handle, Attr)> {
-        let (export, rel) = self.child(dir, name)?;
+        let (export, _, rel, existing) = self.child(dir, name)?;
         // Never open through a symlink, or onto a directory.
-        if let Ok(md) = confine::lstat(&export.root, &rel)
+        if let Some(md) = existing
             && md.kind != Type::File
         {
             return Err(if how == CreateMode::Guarded || md.kind != Type::Dir { Error::Exist } else { Error::IsDir });
@@ -731,22 +814,42 @@ impl Vfs {
     }
 
     pub fn mkdir(&self, dir: &Handle, name: &[u8], sa: &SetAttr) -> Result<(Handle, Attr)> {
-        let (export, rel) = self.child(dir, name)?;
+        let (export, _, rel, existing) = self.child(dir, name)?;
+        if existing.is_some() {
+            return Err(Error::Exist);
+        }
         confine::mkdir(&export.root, &rel)?;
         apply(&export.root, &rel, &confine::lstat(&export.root, &rel)?, &SetAttr { size: None, ..sa.clone() })?;
         self.created(dir, &export, &rel)
     }
 
     pub fn symlink(&self, dir: &Handle, name: &[u8], target: &[u8]) -> Result<(Handle, Attr)> {
-        let (export, rel) = self.child(dir, name)?;
+        let (export, dir_rel, rel, existing) = self.child(dir, name)?;
         if !self.symlinks.load(Ordering::Relaxed) {
             return Err(Error::Acces);
         }
-        if target.is_empty() || target.contains(&0) {
+        if target.is_empty() || target.contains(&0) || target.len() as u64 > LINK_MAX {
             return Err(Error::Inval);
         }
-        confine::symlink(&export.root, &rel, &os_string_from_bytes(target)?)?;
-        self.created(dir, &export, &rel)
+        if existing.is_some() {
+            return Err(Error::Exist);
+        }
+        if !self.emulating() {
+            confine::symlink(&export.root, &rel, &os_string_from_bytes(target)?)?;
+            return self.created(dir, &export, &rel);
+        }
+        let lrel = link_rel(&dir_rel, name)?;
+        if confine::lstat(&export.root, &lrel).is_ok() {
+            return Err(Error::Exist); // a real file is in the way
+        }
+        let mut f = confine::open_file(&export.root, &lrel, true, Some(true))?;
+        let written = f.write_all(LINK_MAGIC).and_then(|()| f.write_all(target));
+        drop(f);
+        if let Err(e) = written {
+            let _ = confine::remove(&export.root, &lrel, false);
+            return Err(e.into());
+        }
+        self.created(dir, &export, &lrel)
     }
 
     /// Hard-link `file` as `name` in `dir`.
@@ -758,16 +861,23 @@ impl Vfs {
         if src.md.kind == Type::Dir {
             return Err(Error::IsDir);
         }
-        let (export, rel) = self.child(dir, name)?;
+        let (export, dir_rel, rel, existing) = self.child(dir, name)?;
+        if existing.is_some() {
+            return Err(Error::Exist);
+        }
+        // A link to an emulated symlink is an emulated symlink too.
+        let rel = if src.md.kind == Type::Symlink && Self::is_emulated(&export, &src.rel) { link_rel(&dir_rel, name)? } else { rel };
         confine::hard_link(&export.root, &src.rel, &rel)?;
         export.intern(&rel);
         Ok(())
     }
 
     pub fn remove(&self, dir: &Handle, name: &[u8]) -> Result<()> {
-        let (export, rel) = self.child(dir, name)?;
-        if confine::lstat(&export.root, &rel)?.kind == Type::Dir {
-            return Err(Error::IsDir);
+        let (export, _, rel, existing) = self.child(dir, name)?;
+        match existing {
+            None => return Err(Error::NoEnt),
+            Some(m) if m.kind == Type::Dir => return Err(Error::IsDir),
+            Some(_) => {}
         }
         confine::remove(&export.root, &rel, false)?;
         export.ids.lock().unwrap().forget(&rel);
@@ -775,9 +885,11 @@ impl Vfs {
     }
 
     pub fn rmdir(&self, dir: &Handle, name: &[u8]) -> Result<()> {
-        let (export, rel) = self.child(dir, name)?;
-        if confine::lstat(&export.root, &rel)?.kind != Type::Dir {
-            return Err(Error::NotDir);
+        let (export, _, rel, existing) = self.child(dir, name)?;
+        match existing {
+            None => return Err(Error::NoEnt),
+            Some(m) if m.kind != Type::Dir => return Err(Error::NotDir),
+            Some(_) => {}
         }
         confine::remove(&export.root, &rel, true)?;
         export.ids.lock().unwrap().forget(&rel);
@@ -790,10 +902,26 @@ impl Vfs {
         if from_dir.export != to_dir.export {
             return Err(Error::Xdev);
         }
-        let (export, from_rel) = self.child(from_dir, from)?;
-        let (_, to_rel) = self.child(to_dir, to)?;
+        let (export, _, from_rel, from_md) = self.child(from_dir, from)?;
+        let Some(from_md) = from_md else { return Err(Error::NoEnt) };
+        let (_, to_dir_rel, to_plain, to_md) = self.child(to_dir, to)?;
+        // An emulated link keeps its `symlink-` host name under the new name.
+        let emulated = from_md.kind == Type::Symlink && Self::is_emulated(&export, &from_rel);
+        let to_rel = if emulated { link_rel(&to_dir_rel, to)? } else { to_dir_rel.join(component(to)?) };
         if to_rel.starts_with(&from_rel) && to_rel != from_rel {
             return Err(Error::Inval); // a directory into its own subtree
+        }
+        // The target name may exist in the other form (a file where a link
+        // goes, or the reverse). Replace it, as rename does.
+        if let Some(m) = to_md
+            && to_plain != to_rel
+            && to_plain != from_rel
+        {
+            if m.kind == Type::Dir {
+                return Err(Error::Exist);
+            }
+            confine::remove(&export.root, &to_plain, false)?;
+            export.ids.lock().unwrap().forget(&to_plain);
         }
         confine::rename(&export.root, &from_rel, &to_rel)?;
         export.ids.lock().unwrap().rename(&from_rel, &to_rel);
@@ -836,6 +964,22 @@ fn disk_space(_path: &Path) -> Result<FsStat> {
         free_files: files / 2,
         avail_files: files / 2,
     })
+}
+
+/// Host path of the emulated link for `name` in `dir_rel`.
+fn link_rel(dir_rel: &Path, name: &[u8]) -> Result<PathBuf> {
+    let mut n = LINK_PREFIX.to_vec();
+    n.extend_from_slice(name);
+    Ok(dir_rel.join(component(&n)?))
+}
+
+/// The target stored in an emulated link, if `rel` is one.
+fn read_emulated(root: &Path, rel: &Path) -> Option<Vec<u8>> {
+    let f = confine::open_file(root, rel, false, None).ok()?;
+    let mut buf = Vec::new();
+    f.take(LINK_MAGIC.len() as u64 + LINK_MAX + 1).read_to_end(&mut buf).ok()?;
+    let target = buf.strip_prefix(LINK_MAGIC)?;
+    (!target.is_empty() && target.len() as u64 <= LINK_MAX && !target.contains(&0)).then(|| target.to_vec())
 }
 
 fn writable(export: &Export) -> Result<()> {
@@ -1163,6 +1307,53 @@ mod tests {
         assert_eq!(v.symlink(&r, b"l", b"/etc").unwrap_err(), Error::Acces);
         v.set_symlinks(true);
         v.symlink(&r, b"l", b"/etc").unwrap();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn emulated_symlinks() {
+        let root = temp_dir();
+        fs::create_dir(root.join("d")).unwrap();
+        // A real file that merely has the prefix stays a file.
+        fs::write(root.join("symlink-notes.txt"), b"just notes").unwrap();
+        let v = vfs(&root);
+        v.set_emulate_symlinks(true);
+        let r = v.root(0).unwrap();
+        let d = v.lookup(&r, b"d").unwrap().0;
+
+        let (l, a) = v.symlink(&d, b"lib", b"../usr/lib/libc.so").unwrap();
+        assert_eq!((a.kind, a.size), (Kind::Lnk, 18));
+        assert_eq!(fs::read(root.join("d/symlink-lib")).unwrap(), b"!<bsnfs-symlink>\n../usr/lib/libc.so");
+        assert_eq!(v.readlink(&l).unwrap(), b"../usr/lib/libc.so");
+        assert_eq!(v.lookup(&d, b"lib").unwrap(), (l, v.getattr(&l).unwrap()));
+        assert!(v.read(&l, 0, 10).is_err(), "never opened through");
+        assert!(v.write(&l, 0, b"x", false).is_err());
+        assert_eq!(v.symlink(&d, b"lib", b"x").unwrap_err(), Error::Exist);
+        assert_eq!(v.create(&d, b"lib", CreateMode::Guarded, &SetAttr::default()).unwrap_err(), Error::Exist);
+        assert_eq!(v.mkdir(&d, b"lib", &SetAttr::default()).unwrap_err(), Error::Exist);
+
+        let names = |h: &Handle| -> Vec<(Vec<u8>, Kind)> {
+            v.readdir(h, true).unwrap().entries.iter().skip(2).map(|e| (e.name.clone(), e.attr.kind)).collect()
+        };
+        assert_eq!(names(&d), [(b"lib".to_vec(), Kind::Lnk)]);
+        assert_eq!(names(&r), [(b"d".to_vec(), Kind::Dir), (b"symlink-notes.txt".to_vec(), Kind::Reg)]);
+
+        // Rename keeps it a link under the new name, and the same handle.
+        v.rename(&d, b"lib", &r, b"lib2").unwrap();
+        assert!(root.join("symlink-lib2").exists() && !root.join("d/symlink-lib").exists());
+        assert_eq!(v.lookup(&r, b"lib2").unwrap().0, l);
+        assert_eq!(v.readlink(&l).unwrap(), b"../usr/lib/libc.so");
+        // A hard link to it is a link too.
+        v.link(&l, &d, b"again").unwrap();
+        assert_eq!(v.lookup(&d, b"again").unwrap().1.kind, Kind::Lnk);
+        // Renaming a file onto the link's name replaces the link.
+        v.create(&r, b"plain", CreateMode::Guarded, &SetAttr::default()).unwrap();
+        v.rename(&r, b"plain", &r, b"lib2").unwrap();
+        assert_eq!(v.lookup(&r, b"lib2").unwrap().1.kind, Kind::Reg);
+        assert!(!root.join("symlink-lib2").exists());
+        v.remove(&d, b"again").unwrap();
+        assert!(!root.join("d/symlink-again").exists());
+        assert_eq!(v.lookup(&d, b"again").unwrap_err(), Error::NoEnt);
         fs::remove_dir_all(&root).ok();
     }
 

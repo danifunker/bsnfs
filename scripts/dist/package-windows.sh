@@ -18,6 +18,7 @@ case "${1:-}" in
 esac
 
 case "$TARGET" in
+    i686-pc-windows-*)    ARCH=x86 ;;
     x86_64-pc-windows-*)  ARCH=x64 ;;
     aarch64-pc-windows-*) ARCH=arm64 ;;
     *) die "unsupported Windows target $TARGET" ;;
@@ -31,14 +32,22 @@ ISCC="${ISCC:-/c/Program Files (x86)/Inno Setup 6/ISCC.exe}"
 build "$TARGET"
 REL=$(release_dir "$TARGET")
 [ -f "$REL/bsnfs.exe" ] || die "$REL/bsnfs.exe was not built"
-"$REL/bsnfs.exe" --version || true   # an arm64 build can't run on an x64 host
+"$REL/bsnfs.exe" --version
 
 winpath() { cygpath -w "$1"; }
+
+# Windows file versions are four numbers of at most 65535: YYYY.MM.DD.HHMMSS
+# becomes YYYY.MM.DD.HHMM, X.Y.Z becomes X.Y.Z.0, anything else 0.0.0.0.
+if [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(\.([0-9]{1,4})[0-9]*)?$ ]]; then
+    FILE_VERSION="$((10#${BASH_REMATCH[1]})).$((10#${BASH_REMATCH[2]})).$((10#${BASH_REMATCH[3]})).$((10#${BASH_REMATCH[5]:-0}))"
+else
+    FILE_VERSION=0.0.0.0
+fi
 
 group_start "installer"
 # Git Bash rewrites arguments that look like POSIX paths, and ISCC's /D, /O
 # and /F switches do; without this it sees them as extra script filenames.
-MSYS2_ARG_CONV_EXCL='*' "$ISCC" "/DMyAppVersion=$VERSION" "/DTargetArch=$ARCH" \
+MSYS2_ARG_CONV_EXCL='*' "$ISCC" "/DMyAppVersion=$VERSION" "/DFileVersion=$FILE_VERSION" "/DTargetArch=$ARCH" \
     "/DSourceDir=$(winpath "$REL")" \
     "/DDocDir=$(winpath "$DIST_ROOT")" \
     "/O$(winpath "$OUT_DIR")" \

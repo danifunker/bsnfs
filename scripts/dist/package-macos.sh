@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Build bsnfs for macOS as one universal (arm64 + x86_64) binary and package
-# it as a tarball.
+# it as a tarball. It runs on macOS 10.13+ on Intel (utimensat, which bsnfs
+# uses to set file times, arrived in 10.13) and macOS 11+ on Apple silicon
+# (the first release for it).
 #
 #   scripts/dist/package-macos.sh [options]
 #
@@ -30,7 +32,6 @@ esac
 need lipo codesign ditto
 
 IDENTITY="${MACOS_SIGN_IDENTITY:--}"
-TARGETS=(aarch64-apple-darwin x86_64-apple-darwin)
 
 NOTARY=()
 if [ -n "${NOTARY_KEY_ID:-}" ] && [ -n "${NOTARY_ISSUER_ID:-}" ] && [ -n "${NOTARY_KEY_PATH:-}" ]; then
@@ -66,15 +67,24 @@ notarize() {  # <zip>
     group_end
 }
 
-for t in "${TARGETS[@]}"; do
-    build "$t"
-done
+MIN_X86_64=10.13
+MIN_ARM64=11.0
+MACOSX_DEPLOYMENT_TARGET=$MIN_ARM64 build aarch64-apple-darwin
+MACOSX_DEPLOYMENT_TARGET=$MIN_X86_64 build x86_64-apple-darwin
 
 WORK=$(stage_dir)
 trap 'rm -rf "$WORK"' EXIT
 lipo -create -output "$WORK/bsnfs" \
     "$(release_dir aarch64-apple-darwin)/bsnfs" "$(release_dir x86_64-apple-darwin)/bsnfs"
 strip -x "$WORK/bsnfs"
+
+# Check each slice really carries the minimum OS we built for.
+minos() {  # <arch>
+    otool -arch "$1" -l "$WORK/bsnfs" | awk '/LC_BUILD_VERSION/ {b=1} b && /minos/ {print $2; exit} /LC_VERSION_MIN_MACOSX/ {v=1} v && /version/ {print $2; exit}'
+}
+[ "$(minos x86_64)" = "$MIN_X86_64" ] || die "x86_64 slice targets macOS $(minos x86_64), not $MIN_X86_64"
+[ "$(minos arm64)" = "$MIN_ARM64" ] || die "arm64 slice targets macOS $(minos arm64), not $MIN_ARM64"
+log "minimum macOS: $(minos x86_64) (Intel), $(minos arm64) (Apple silicon)"
 
 group_start "sign"
 if [ "$IDENTITY" = "-" ]; then

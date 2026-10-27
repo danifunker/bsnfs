@@ -4,8 +4,8 @@
 # scripts do the building and packaging, so running one by hand gives you the
 # same files.
 #
-# Called by nightly.yml and release.yml, which then publish what this leaves
-# behind as workflow artifacts. Run it by hand (Actions > Build > Run workflow)
+# Called by release.yml, which then publishes what this leaves behind as
+# workflow artifacts. Run it by hand (Actions > Build > Run workflow)
 # to check that a branch builds everywhere without publishing anything.
 
 name: Build
@@ -32,6 +32,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Run every JavaScript action on Node 24.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   version:
@@ -61,8 +63,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: x64,   target: x86_64-unknown-linux-musl,  runner: ubuntu-24.04 }
-          - { arch: arm64, target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm }
+          - { arch: x64,     target: x86_64-unknown-linux-musl,    runner: ubuntu-24.04,     formats: "tar,deb,rpm,pkg,appimage" }
+          - { arch: arm64,   target: aarch64-unknown-linux-musl,   runner: ubuntu-24.04-arm, formats: "tar,deb,rpm,pkg,appimage" }
+          # No riscv64 runner exists: cross-build on x86_64 and run the
+          # binary under QEMU. No AppImage: appimagetool has no riscv64 build.
+          - { arch: riscv64, target: riscv64gc-unknown-linux-musl, runner: ubuntu-24.04,     formats: "tar,deb,rpm,pkg",
+              cross: "gcc-riscv64-linux-gnu qemu-user-static" }
     steps:
       - uses: actions/checkout@v5
         with:
@@ -70,7 +76,7 @@ jobs:
       - name: Toolchain and packagers
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools rpm zstd file
+          sudo apt-get install -y musl-tools rpm zstd file curl ${{ matrix.cross }}
           rustup toolchain install stable --profile minimal && rustup default stable
           rustup target add ${{ matrix.target }}
       - uses: actions/cache@v5
@@ -82,7 +88,9 @@ jobs:
           key: dist-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}
           restore-keys: dist-${{ matrix.target }}-
       - name: Build and package
-        run: scripts/dist/package-linux.sh --target ${{ matrix.target }} --version "${{ needs.version.outputs.version }}"
+        run: >
+          scripts/dist/package-linux.sh --target ${{ matrix.target }} --formats ${{ matrix.formats }}
+          --version "${{ needs.version.outputs.version }}"
       - uses: actions/upload-artifact@v7
         with:
           name: dist-linux-${{ matrix.arch }}
@@ -182,6 +190,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - { arch: x86,   target: i686-pc-windows-msvc,    runner: windows-latest }
           - { arch: x64,   target: x86_64-pc-windows-msvc,  runner: windows-latest }
           - { arch: arm64, target: aarch64-pc-windows-msvc, runner: windows-11-arm }
     steps:

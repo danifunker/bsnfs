@@ -19,12 +19,16 @@ Download the file for your system from the
 
 | System | Download | Then |
 | --- | --- | --- |
-| Windows | `bsnfs-setup-windows-x64-….exe` (or `arm64`) | Run it. It can set bsnfs up as a service and opens the admin page. |
-| Debian, Ubuntu | `bsnfs-linux-x64-….deb` (or `arm64`) | `sudo apt install ./bsnfs-linux-*.deb` |
+| Windows 10/11 (x64 or 32-bit x86), Windows 11 on ARM | `bsnfs-setup-windows-x64-….exe` (or `x86`, `arm64`) | Run it. It can set bsnfs up as a service and opens the admin page. |
+| Debian, Ubuntu | `bsnfs-linux-x64-….deb` (or `arm64`, `riscv64`) | `sudo apt install ./bsnfs-linux-*.deb` |
 | Fedora, RHEL, openSUSE | `bsnfs-linux-x64-….rpm` | `sudo dnf install ./bsnfs-linux-*.rpm` |
 | Arch | `bsnfs-linux-x64-….pkg.tar.zst` | `sudo pacman -U bsnfs-linux-*.pkg.tar.zst` |
-| Any Linux | `bsnfs-linux-x64-….tar.gz` | Unpack; the `bsnfs` program runs on any distribution. |
-| macOS | `bsnfs-macos-universal-….tar.gz` | Unpack, then `sudo mv bsnfs /usr/local/bin/`. |
+| Any Linux | `bsnfs-linux-x64-….AppImage` or `.tar.gz` | `chmod +x` the AppImage and run it, or unpack the tarball. |
+| macOS 10.13+ (Intel), 11+ (Apple silicon) | `bsnfs-macos-universal-….tar.gz` | Unpack, then `sudo mv bsnfs /usr/local/bin/`. |
+
+Every Linux build is a single static program, so it runs on any distribution.
+There's a new release for every change; the version is its date and time
+(e.g. `2026.10.27.015312`).
 
 Or build it yourself with [Rust](https://rustup.rs): `cargo build --release`
 puts the program at `target/release/bsnfs`.
@@ -190,11 +194,25 @@ You can tighten things further:
 - `--no-symlinks` stops clients creating symlinks. bsnfs never follows them,
   but other programs on your computer (backup tools, file browsers, a future
   FTP or HTTP service) might.
+- `--emulate-symlinks` stores client symlinks as small files instead (see
+  below), which no program on your computer will follow.
 - `--read-only`, and `--bind` with a firewall, to limit who can reach it.
 
 What it doesn't protect against: anyone who can reach the server can mount
 it (NFS v2/v3 have no real authentication), and they can do anything the
 account bsnfs runs as can do *inside* the shared folders.
+
+### Symlinks on Windows (and FAT/exFAT disks)
+
+Old Unix software expects symlinks, but Windows (and FAT or exFAT disks)
+can't hold real ones. There, bsnfs stores a client's symlink `lib` as an
+ordinary file named `symlink-lib`, containing a marker line and the link's
+target. Clients see a normal symlink (`ls -l`, `readlink`, `tar` all work);
+on your computer it's just a small text file nothing will follow. A file
+only counts as a link if it starts with the marker, so your own files named
+`symlink-...` are left alone.
+
+This is always on for Windows hosts; elsewhere use `--emulate-symlinks`.
 
 ## Running in Docker
 
@@ -283,6 +301,8 @@ bsnfs service uninstall
       --admin-host NAME    also answer the web page under this host name
       --share-root DIR     the web page may only share folders inside DIR (repeatable)
       --no-symlinks        refuse client requests to create symlinks
+      --emulate-symlinks   store client symlinks as `symlink-NAME` files
+                           (always on for Windows hosts)
   -c, --exports-file FILE  load shares from FILE; web page changes are saved there
       --log-file FILE      log to FILE instead of the terminal
   -v / -vv / -q            log every request / also errors / warnings only
@@ -300,10 +320,10 @@ The exports file is plain text, one share per line: `NAME<TAB>PATH`, with
 - File locks are always granted but not enforced between clients.
 - NFSv2 can't handle files over 4 GiB (a protocol limit).
 - No NFSv4 yet. (NFSv1 was never released, so v2 is the oldest there is.)
-- Windows hosts: built by the release pipeline but not yet tried on a real
+- Windows hosts: built and tested by CI, but not yet tried on a real
   machine. Containment there is best effort: each step of a path is checked
   for symlinks and junctions, but a client racing its own requests could in
-  principle slip one in between check and use. Symlinks can't be created.
+  principle slip one in between check and use. Client symlinks are emulated.
 
 ## How it works
 
@@ -358,11 +378,20 @@ cargo clippy --all-targets
 Everything is built by the scripts in `scripts/dist/`, which GitHub Actions
 runs. `.github/workflows/`:
 
-- `ci.yml`: lint and test on Linux, macOS and Windows for every push.
-- `nightly.yml`: every day, builds `main` and replaces the `nightly`
-  pre-release.
-- `release.yml`: `git tag v1.2.3 && git push origin v1.2.3` builds and
-  publishes release 1.2.3.
+- `release.yml`: **every push to `main` is a release.** It runs the tests,
+  builds every platform, and publishes the result as release
+  `YYYY.MM.DD.HHMMSS` (the commit's UTC time, tagged `v…`), marked as the
+  latest, with the commits since the previous release in its notes.
+- `build.yml`: the builds themselves; run it by hand (Actions > Build > Run
+  workflow) to try a branch without releasing anything.
+- `ci.yml`: lint and test on Linux, macOS and Windows, for pull requests and
+  other branches.
+
+What gets built: Windows x86, x64 and ARM64 (zip and installer; Windows 10+,
+ARM64 for Windows 11); macOS as one universal binary (10.13+ Intel, 11+ Apple
+silicon); Linux x64, ARM64 and RISC-V 64 as static binaries in tarballs, deb,
+rpm and Arch packages, plus AppImages for x64 and ARM64. riscv64 is
+cross-built on x86-64 and checked under QEMU.
 
 For a notarized macOS binary, add these repository secrets (otherwise it's
 signed ad hoc, and macOS asks users to approve it on first run):

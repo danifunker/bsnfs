@@ -1,7 +1,8 @@
 ; Inno Setup script for the bsnfs Windows installer. Built by
 ; scripts/dist/package-windows.sh, which passes these defines:
 ;   MyAppVersion  version string, e.g. 1.2.3 or nightly.2026.10.26
-;   TargetArch    x64 or arm64
+;   FileVersion   the same as four numbers, each at most 65535
+;   TargetArch    x86, x64 or arm64
 ;   SourceDir     folder holding bsnfs.exe
 ;   DocDir        folder holding README.md, GOAL.md and the licenses
 ;
@@ -12,6 +13,9 @@
 #ifndef MyAppVersion
   #define MyAppVersion "0.0.0"
 #endif
+#ifndef FileVersion
+  #define FileVersion "0.0.0.0"
+#endif
 #ifndef TargetArch
   #define TargetArch "x64"
 #endif
@@ -21,6 +25,7 @@ AppId={{6F4D2B1E-8C3A-4E5F-9B7D-2A1C0E9F8B64}
 AppName=bsnfs
 AppVersion={#MyAppVersion}
 AppVerName=bsnfs {#MyAppVersion}
+VersionInfoVersion={#FileVersion}
 AppPublisher=bsnfs
 DefaultDirName={autopf}\bsnfs
 DisableProgramGroupPage=yes
@@ -31,12 +36,18 @@ SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayIcon={app}\bsnfs.exe
 LicenseFile={#DocDir}\LICENSE
+; Windows 10 and later; the ARM64 build is for Windows 11 on ARM.
 #if TargetArch == "arm64"
 ArchitecturesAllowed=arm64
 ArchitecturesInstallIn64BitMode=arm64
-#else
+MinVersion=10.0.22000
+#elif TargetArch == "x64"
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+MinVersion=10.0
+#else
+ArchitecturesAllowed=x86compatible
+MinVersion=10.0
 #endif
 
 [Tasks]
