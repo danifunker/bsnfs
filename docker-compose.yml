@@ -1,0 +1,22 @@
+services:
+  bsnfs:
+    build: .
+    container_name: bsnfs
+    restart: unless-stopped
+    ports:
+      - "2049:2049/tcp"
+      - "2049:2049/udp"
+      # Drop these two if the host already runs rpcbind on 111; clients then
+      # mount with -o port=2049,mountport=2049,nolock (see README).
+      - "111:111/tcp"
+      - "111:111/udp"
+      - "8080:8080"
+    volumes:
+      - ./shared:/share
+      - bsnfs-config:/config
+    environment:
+      BSNFS_ADMIN_PASSWORD: "change-me"
+    # Files the server creates are owned by this user on the host.
+    # user: "1000:1000"
+volumes:
+  bsnfs-config:

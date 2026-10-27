@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bsnfs</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #6a7282; --line: #e3e6eb;
+  --accent: #2f6fde; --accent-text: #ffffff; --ok: #1f8a4c; --warn: #b26a00; --bad: #c23b3b;
+  --code: #f0f2f5; --shadow: 0 1px 2px rgba(20, 30, 50, .06);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171c; --panel: #1c2027; --text: #e6e9ef; --muted: #8d95a5; --line: #2c323c;
+    --accent: #5b8ff0; --accent-text: #0d1117; --ok: #4cc27f; --warn: #e0a040; --bad: #ef6b6b;
+    --code: #252a33; --shadow: none;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; padding: 18px 24px 8px; }
+header h1 { margin: 0; font-size: 20px; letter-spacing: -.01em; }
+header .meta { color: var(--muted); font-size: 13px; }
+main { padding: 8px 24px 40px; display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); max-width: 1400px; }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; box-shadow: var(--shadow); min-width: 0; }
+section.wide { grid-column: 1 / -1; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 12px; font-weight: 600; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 600; color: var(--muted); font-size: 12px; }
+tr:last-child td { border-bottom: none; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+code { background: var(--code); padding: 1px 5px; border-radius: 4px; word-break: break-all; }
+.muted { color: var(--muted); }
+.empty { color: var(--muted); padding: 8px 0; }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 12px; border: 1px solid var(--line); }
+.pill.ok { color: var(--ok); border-color: currentColor; }
+.pill.warn { color: var(--warn); border-color: currentColor; }
+button, .btn { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+button.danger:hover { border-color: var(--bad); color: var(--bad); }
+input[type=text] { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); width: 100%; }
+form.add { display: grid; grid-template-columns: 160px 1fr auto auto auto; gap: 8px; align-items: center; margin-top: 14px; }
+.browser { margin-top: 10px; border: 1px solid var(--line); border-radius: 8px; max-height: 260px; overflow: auto; display: none; }
+.browser.open { display: block; }
+.browser div { padding: 5px 10px; cursor: pointer; border-bottom: 1px solid var(--line); }
+.browser div:hover { background: var(--code); }
+.browser .cur { font-weight: 600; cursor: default; background: var(--code); }
+.stats { display: flex; gap: 28px; flex-wrap: wrap; margin-bottom: 12px; }
+.stat b { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
+.stat span { color: var(--muted); font-size: 12px; }
+.bar { height: 6px; background: var(--accent); border-radius: 3px; opacity: .75; }
+.error { color: var(--bad); margin-top: 8px; min-height: 1em; }
+.copy { cursor: pointer; }
+.copy:hover { outline: 1px solid var(--accent); }
+@media (max-width: 600px) {
+  header, main { padding-left: 16px; padding-right: 16px; }
+  main { grid-template-columns: 1fr; }
+  form.add { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>bsnfs</h1>
+  <span class="meta" id="meta">connecting…</span>
+</header>
+<main>
+  <section class="wide">
+    <h2>Shared folders</h2>
+    <table>
+      <thead><tr><th>Export</th><th>Host folder</th><th>Access</th><th class="num">Mounts</th><th>Mount with</th><th></th></tr></thead>
+      <tbody id="exports"></tbody>
+    </table>
+    <form class="add" id="add">
+      <input type="text" name="name" placeholder="/name (optional)">
+      <input type="text" name="path" id="path" placeholder="/path/to/folder on this host" required>
+      <button type="button" id="browse">Browse…</button>
+      <label><input type="checkbox" name="read_only"> read-only</label>
+      <button class="primary" type="submit">Share</button>
+    </form>
+    <div class="browser" id="browser"></div>
+    <div class="error" id="add-error"></div>
+  </section>
+
+  <section>
+    <h2>Mounted by</h2>
+    <table>
+      <thead><tr><th>Client</th><th>Path</th><th class="num">Since</th></tr></thead>
+      <tbody id="mounts"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Clients</h2>
+    <table>
+      <thead><tr><th>Address</th><th>Machine</th><th class="num">Calls</th><th class="num">Last seen</th></tr></thead>
+      <tbody id="clients"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Activity</h2>
+    <div class="stats" id="totals"></div>
+    <table>
+      <thead><tr><th>Call</th><th class="num">Count</th><th style="width:40%"></th></tr></thead>
+      <tbody id="percall"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Recent calls</h2>
+    <table>
+      <thead><tr><th class="num">Ago</th><th>Client</th><th>Call</th><th class="num">uid</th><th class="num">Time</th></tr></thead>
+      <tbody id="recent"></tbody>
+    </table>
+  </section>
+
+  <section class="wide">
+    <h2>Server</h2>
+    <table><tbody id="server"></tbody></table>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+function dur(s) {
+  s = Math.max(0, s);
+  if (s < 1) return "now";
+  if (s < 60) return Math.round(s) + "s";
+  if (s < 3600) return Math.round(s / 60) + "m";
+  if (s < 86400) return (s / 3600).toFixed(1) + "h";
+  return (s / 86400).toFixed(1) + "d";
+}
+
+async function api(path, form) {
+  const opts = form
+    ? { method: "POST", headers: { "X-Requested-With": "bsnfs", "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(form) }
+    : {};
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(() => ({ error: r.statusText }));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+function rows(el, list, render, emptyText, cols) {
+  el.innerHTML = list.length ? list.map(render).join("") : `<tr><td colspan="${cols}" class="empty">${emptyText}</td></tr>`;
+}
+
+function render(s) {
+  const pm = s.ports.portmap;
+  $("meta").textContent = `v${s.version} · up ${dur(s.uptime)} · NFS ${s.versions.map((v) => "v" + v).join("/")} on port ${s.ports.nfs}`;
+
+  rows($("exports"), s.exports, (e) => `<tr>
+      <td><code>${esc(e.name)}</code></td>
+      <td class="mono">${esc(e.path)}</td>
+      <td><span class="pill ${e.read_only ? "warn" : "ok"}">${e.read_only ? "read-only" : "read-write"}</span>
+          <button data-ro="${e.id}" data-v="${e.read_only ? 0 : 1}">${e.read_only ? "allow writes" : "make read-only"}</button></td>
+      <td class="num">${e.mounts}</td>
+      <td><code class="copy" title="Click to copy">${esc(e.mount_command)}</code></td>
+      <td><button class="danger" data-rm="${e.id}" data-name="${esc(e.name)}">Stop sharing</button></td>
+    </tr>`, "Nothing shared yet. Add a folder below.", 6);
+
+  rows($("mounts"), s.mounts, (m) => `<tr>
+      <td>${esc(m.host)}${m.host !== m.client ? ` <span class="muted">${esc(m.client)}</span>` : ""}</td>
+      <td><code>${esc(m.path)}</code></td><td class="num">${dur(m.since)}</td></tr>`,
+    "No clients have mounted anything. (NFSv4-style or long-running mounts may not show here.)", 3);
+
+  rows($("clients"), s.clients, (c) => `<tr>
+      <td class="mono">${esc(c.addr)}</td><td>${esc(c.machine || "—")}</td>
+      <td class="num">${c.calls.toLocaleString()}</td><td class="num">${dur(c.last_seen)}</td></tr>`,
+    "No clients yet.", 4);
+
+  const calls = Object.entries(s.per_call).sort((a, b) => b[1] - a[1]);
+  const max = calls.length ? calls[0][1] : 1;
+  $("totals").innerHTML = `<div class="stat"><b>${s.calls.toLocaleString()}</b><span>calls</span></div>
+    <div class="stat"><b>${s.clients.length}</b><span>clients</span></div>
+    <div class="stat"><b>${s.mounts.length}</b><span>mounts</span></div>`;
+  rows($("percall"), calls.slice(0, 15), ([k, v]) => `<tr><td class="mono">${esc(k)}</td><td class="num">${v.toLocaleString()}</td>
+      <td><div class="bar" style="width:${Math.max(2, (100 * v) / max)}%"></div></td></tr>`, "No calls yet.", 3);
+
+  rows($("recent"), s.recent.slice(0, 25), (r) => `<tr>
+      <td class="num">${dur(r.ago)}</td><td class="mono">${esc(r.peer)} <span class="muted">${r.transport}</span></td>
+      <td class="mono">${esc(r.call)}</td><td class="num">${r.uid}</td>
+      <td class="num">${r.micros < 1000 ? r.micros + "µs" : (r.micros / 1000).toFixed(1) + "ms"}</td></tr>`, "No calls yet.", 5);
+
+  const server = [
+    ["Listening on", `${esc(s.bind)} · ${[s.udp && "UDP", s.tcp && "TCP"].filter(Boolean).join(" + ")}`],
+    ["NFS port", s.ports.nfs],
+    ["MOUNT port", s.ports.mount],
+    ["Lock manager", s.ports.nlm === null ? "off (clients should mount with -o nolock)" : `port ${s.ports.nlm} (grants every lock)`],
+    ["Portmapper", pm.mode === "own" ? `built-in, port ${pm.port}` : pm.mode === "system" ? "registered with the host's portmapper" : "off: clients need explicit port options"],
+    ["Permissions", "synthetic: every file is shown as owned by the client user asking, and every access is granted"],
+    ["Exports file", s.exports_file ? `<code>${esc(s.exports_file)}</code> (changes here are saved)` : "none: changes here last until restart"],
+  ];
+  $("server").innerHTML = server.map(([k, v]) => `<tr><th style="width:180px">${k}</th><td>${v}</td></tr>`).join("");
+}
+
+async function refresh() {
+  try {
+    render(await api("/api/status"));
+  } catch (e) {
+    $("meta").textContent = "disconnected: " + e.message;
+  }
+}
+
+document.addEventListener("click", async (ev) => {
+  const t = ev.target;
+  try {
+    if (t.dataset.rm !== undefined) {
+      if (!confirm(`Stop sharing ${t.dataset.name}? Clients using it will get stale file handle errors.`)) return;
+      await api("/api/exports/remove", { id: t.dataset.rm });
+      refresh();
+    } else if (t.dataset.ro !== undefined) {
+      await api("/api/exports/readonly", { id: t.dataset.ro, read_only: t.dataset.v });
+      refresh();
+    } else if (t.classList.contains("copy")) {
+      await navigator.clipboard.writeText(t.textContent);
+      t.title = "Copied";
+    }
+  } catch (e) {
+    alert(e.message);
+  }
+});
+
+$("add").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const f = new FormData(ev.target);
+  $("add-error").textContent = "";
+  try {
+    await api("/api/exports/add", { name: f.get("name"), path: f.get("path"), read_only: f.get("read_only") ? 1 : 0 });
+    ev.target.reset();
+    $("browser").classList.remove("open");
+    refresh();
+  } catch (e) {
+    $("add-error").textContent = e.message;
+  }
+});
+
+async function browse(path) {
+  const b = $("browser");
+  try {
+    const r = await api("/api/browse?path=" + encodeURIComponent(path || ""));
+    $("path").value = r.path;
+    b.innerHTML = `<div class="cur mono">${esc(r.path)}</div>` +
+      (r.parent ? `<div data-dir="${esc(r.parent)}">⬑ ..</div>` : "") +
+      r.dirs.map((d) => `<div data-dir="${esc(r.path.replace(/\/$/, "") + "/" + d)}">📁 ${esc(d)}</div>`).join("");
+    b.classList.add("open");
+  } catch (e) {
+    $("add-error").textContent = e.message;
+  }
+}
+$("browse").addEventListener("click", () => ($("browser").classList.contains("open") ? $("browser").classList.remove("open") : browse($("path").value)));
+$("browser").addEventListener("click", (ev) => { if (ev.target.dataset.dir) browse(ev.target.dataset.dir); });
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
