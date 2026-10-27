@@ -37,6 +37,11 @@ case "$TARGET" in
     *) die "unsupported Linux target $TARGET (want x86_64, aarch64 or riscv64gc -unknown-linux-musl)" ;;
 esac
 
+# Always link statically: the x86_64 and aarch64 musl targets do by default,
+# but riscv64gc-unknown-linux-musl doesn't.
+var="CARGO_TARGET_$(echo "$TARGET" | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
+export "$var=-C target-feature=+crt-static"
+
 # Cross build: link, strip and run with the target's tools.
 STRIP=strip
 RUN=()

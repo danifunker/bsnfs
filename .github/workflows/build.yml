@@ -32,6 +32,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Ride out the occasional DNS or network blip on a runner.
+  CARGO_NET_RETRY: 10
   # Run every JavaScript action on Node 24.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 

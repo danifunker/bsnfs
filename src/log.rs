@@ -44,11 +44,11 @@ pub fn timestamp() -> String {
         .unwrap_or_default();
     #[cfg(unix)]
     let (h, m, s) = {
-        let secs = now.as_secs() as libc::time_t;
-        // SAFETY: localtime_r only writes into the tm we pass it.
+        // SAFETY: localtime_r only writes into the tm we pass it. (`as _`
+        // rather than naming time_t, whose width musl is changing.)
         let tm = unsafe {
             let mut tm: libc::tm = std::mem::zeroed();
-            libc::localtime_r(&secs, &mut tm);
+            libc::localtime_r(&(now.as_secs() as _), &mut tm);
             tm
         };
         (tm.tm_hour as u64, tm.tm_min as u64, tm.tm_sec as u64)
