@@ -134,7 +134,6 @@ Version: $(echo "$PKGVER" | tr '-' '_')
 Release: 1
 Summary: $SUMMARY
 License: MIT AND BSD-3-Clause
-BuildArch: $PKG_ARCH
 
 %description
 $DESCRIPTION
@@ -156,11 +155,15 @@ $PRERM
 %config(noreplace) /etc/bsnfs/bsnfs.conf
 %doc /usr/share/doc/bsnfs
 SPEC
+    # No BuildArch in the spec: it only packages a binary already built, and
+    # rpmbuild refuses a BuildArch it can't build on this host (riscv64 on
+    # x86_64). --target sets the package's architecture instead.
     rpmbuild --quiet --define "_topdir $S/top" --define "_build_id_links none" \
         --define "_binaries_in_noarch_packages_terminate_build 0" --target "$PKG_ARCH-linux" -bb "$S/bsnfs.spec"
     mv "$S"/top/RPMS/*/*.rpm "$OUT_DIR/$BASE.rpm"
     rm -rf "$S"
     rpm -qp --qf '%{NAME} %{VERSION} %{ARCH}\n' "$OUT_DIR/$BASE.rpm"
+    [ "$(rpm -qp --qf '%{ARCH}' "$OUT_DIR/$BASE.rpm")" = "$PKG_ARCH" ] || die "$BASE.rpm is not arch $PKG_ARCH"
     group_end
 fi
 
