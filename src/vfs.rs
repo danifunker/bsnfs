@@ -678,8 +678,12 @@ impl Vfs {
     /// Flush a file's data to stable storage (NFSv3 COMMIT).
     pub fn commit(&self, h: &Handle) -> Result<()> {
         let node = self.resolve(h)?;
-        if node.md.kind == Type::File {
-            Self::open_file(&node, false)?.sync_all()?;
+        // Flushing needs write access on Windows. A file we can't open for
+        // writing holds no unflushed writes of ours, so there's nothing to do.
+        if node.md.kind == Type::File
+            && let Ok(f) = Self::open_file(&node, true)
+        {
+            f.sync_all()?;
         }
         Ok(())
     }

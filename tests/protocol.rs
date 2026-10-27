@@ -286,18 +286,34 @@ fn nfs3_file_lifecycle_over_tcp_and_udp() {
         assert_eq!(cur.u32(), Some(0));
         assert_eq!(fattr3_size(&mut cur), data.len() as u64);
 
-        // SYMLINK + READLINK.
-        let r = c.call(NFS, 3, 10, &args(|x| {
-            diropargs(x, &dirfh, b"link");
-            empty_sattr3(x);
-            x.opaque(b"hello.txt");
-        }));
-        let linkfh = v3_new_handle(&r, false).unwrap();
-        let r = c.call(NFS, 3, 5, &args(|x| x.opaque(&linkfh)));
-        let mut cur = Cur::new(&r);
-        assert_eq!(cur.u32(), Some(0));
-        skip_post_op(&mut cur);
-        assert_eq!(cur.opaque(100).unwrap(), b"hello.txt");
+        // SYMLINK + READLINK. Windows hosts don't create symlinks, so there
+        // `link` is a plain file, which the steps below treat the same.
+        if cfg!(unix) {
+            let r = c.call(NFS, 3, 10, &args(|x| {
+                diropargs(x, &dirfh, b"link");
+                empty_sattr3(x);
+                x.opaque(b"hello.txt");
+            }));
+            let linkfh = v3_new_handle(&r, false).unwrap();
+            let r = c.call(NFS, 3, 5, &args(|x| x.opaque(&linkfh)));
+            let mut cur = Cur::new(&r);
+            assert_eq!(cur.u32(), Some(0));
+            skip_post_op(&mut cur);
+            assert_eq!(cur.opaque(100).unwrap(), b"hello.txt");
+        } else {
+            let r = c.call(NFS, 3, 10, &args(|x| {
+                diropargs(x, &dirfh, b"link");
+                empty_sattr3(x);
+                x.opaque(b"hello.txt");
+            }));
+            assert_eq!(Cur::new(&r).u32(), Some(10004), "NOTSUPP");
+            let r = c.call(NFS, 3, 8, &args(|x| {
+                diropargs(x, &dirfh, b"link");
+                x.u32(1);
+                empty_sattr3(x);
+            }));
+            v3_new_handle(&r, false).unwrap();
+        }
 
         // RENAME, then the old name is gone and the handle still works.
         let r = c.call(NFS, 3, 14, &args(|x| {
