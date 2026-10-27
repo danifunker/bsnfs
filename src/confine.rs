@@ -418,8 +418,11 @@ pub fn subdir_count(root: &Path, rel: &Path) -> io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::vfs::SetTime;
-    use std::ffi::{OsStr, OsString};
+    #[cfg(unix)]
+    use std::ffi::OsStr;
+    use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
 

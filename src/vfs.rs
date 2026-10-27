@@ -125,6 +125,7 @@ pub struct Time {
 }
 
 impl Time {
+    #[cfg_attr(not(unix), allow(dead_code))] // used by the Unix confine
     pub(crate) fn from_parts(secs: i64, nsecs: i64) -> Self {
         Self { secs: secs.clamp(0, u32::MAX as i64) as u32, nsecs: nsecs.clamp(0, 999_999_999) as u32 }
     }
