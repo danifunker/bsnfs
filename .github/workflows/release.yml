@@ -42,7 +42,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION=$(scripts/dist/version.sh timestamp)
-          PREVIOUS=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
+          # The newest release other than this one: re-running a release
+          # republishes the same version, and must still compare against the
+          # one before it.
+          PREVIOUS=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --limit 30 --json tagName \
+            --jq "[.[] | select(.tagName != \"v$VERSION\")][0].tagName // empty" 2>/dev/null || true)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
