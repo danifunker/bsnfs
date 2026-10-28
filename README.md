@@ -394,16 +394,22 @@ rpm and Arch packages, plus AppImages for x64 and ARM64. riscv64 is
 cross-built on x86-64 and checked under QEMU.
 
 For a notarized macOS binary, add these repository secrets (otherwise it's
-signed ad hoc, and macOS asks users to approve it on first run):
+signed ad hoc, and macOS asks users to approve it on first run). They use the
+same names and formats as [MiSTerKVMS](https://github.com/danifunker/MiSTerKVMS),
+so the same certificate and API key serve both:
 
 | Secret | What it is |
 | --- | --- |
-| `MACOS_CERTIFICATE`, `MACOS_CERTIFICATE_PWD` | base64 of a .p12 with your **Developer ID Application** certificate and key, and its password |
-| `APP_STORE_CONNECT_KEY_ID`, `APP_STORE_CONNECT_ISSUER_ID`, `APP_STORE_CONNECT_PRIVATE_KEY` | an App Store Connect API key (base64 of the .p8), for notarization |
+| `MACOS_CERT_P12` | base64 of a .p12 holding your **Developer ID Application** certificate and its key |
+| `MACOS_CERT_PASSWORD` | the .p12's password |
+| `APPLE_API_KEY_P8` | an App Store Connect API key (Team key), the .p8 pasted as text or base64 |
+| `APPLE_API_KEY_ID` | that key's ID (the `XXXXXXXXXX` in `AuthKey_XXXXXXXXXX.p8`) |
+| `APPLE_API_ISSUER_ID` | your team's issuer ID (a UUID, on the same App Store Connect page) |
 
-(or `MACOS_NOTARIZE_APPLE_ID`, `MACOS_NOTARIZE_PASSWORD`, `MACOS_TEAM_ID`
-instead of the API key). Then set the repository variable
-`REQUIRE_NOTARIZATION=true` so a release can't ship without it.
+The macOS job checks the API key with Apple before building, so a wrong value
+fails in seconds with a message saying which. Once signing works, set the
+repository variable `REQUIRE_NOTARIZATION=true` so a release can't ship
+without it.
 
 To build locally: `scripts/dist/package-macos.sh`, `package-linux.sh` (on
 Linux) or `package-windows.sh` (Git Bash on Windows); files land in `dist/`.
