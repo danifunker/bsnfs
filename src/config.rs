@@ -44,9 +44,12 @@ Options:
       --emulate-symlinks   store client symlinks as `symlink-NAME` files, for
                            disks that can't hold real ones (FAT, exFAT);
                            always on for Windows hosts
-  -c, --exports-file FILE  load exports from FILE and save admin UI changes
-                           to it
+  -c, --exports-file FILE  where shares added in the admin UI are saved
+                           (default: a per-user file, see below)
+      --no-save            don't save admin UI changes; they last until exit
       --log-file FILE      write the log to FILE instead of the terminal
+      --watch-stdin        exit when standard input closes (for apps that
+                           run bsnfs as a child process)
   -v, --verbose            log every call (-vv: also each error)
   -q, --quiet              warnings only
   -V, --version
@@ -64,7 +67,8 @@ Options on the command line override the file.
 
 /// Options that take no value. In a config file they may be followed by
 /// yes/no (or true/false, on/off).
-const FLAGS: &[&str] = &["no-udp", "no-tcp", "no-nlm", "read-only", "no-admin", "no-symlinks", "emulate-symlinks", "verbose", "quiet"];
+const FLAGS: &[&str] =
+    &["no-udp", "no-tcp", "no-nlm", "read-only", "no-admin", "no-symlinks", "emulate-symlinks", "no-save", "verbose", "quiet"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortmapMode {
@@ -79,6 +83,9 @@ pub struct ExportSpec {
     pub name: String,
     pub path: PathBuf,
     pub read_only: bool,
+    /// From the exports file (the admin page's saved shares), rather than
+    /// the command line or a config file. Only these are written back.
+    pub saved: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +109,9 @@ pub struct Config {
     pub symlinks: bool,
     pub emulate_symlinks: bool,
     pub log_file: Option<PathBuf>,
+    /// Exit when standard input closes: lets a parent (the macOS app) take
+    /// the server down with it even if the parent is killed.
+    pub watch_stdin: bool,
     pub verbosity: u8,
 }
 
@@ -127,6 +137,7 @@ impl Default for Config {
             symlinks: true,
             emulate_symlinks: false,
             log_file: None,
+            watch_stdin: false,
             verbosity: 1,
         }
     }
@@ -202,6 +213,7 @@ pub fn config_file_args(path: &Path) -> Result<Vec<String>, String> {
 fn parse_args(args: Vec<String>) -> Result<Parsed, String> {
     let mut cfg = Config::default();
     let mut read_only = false;
+    let mut no_save = false;
     let mut args = args.into_iter().map(Ok::<String, String>);
     while let Some(arg) = args.next() {
         let arg = arg?;
@@ -220,6 +232,7 @@ fn parse_args(args: Vec<String>) -> Result<Parsed, String> {
             "-h" | "--help" => return Ok(Parsed::Help),
             "-V" | "--version" => return Ok(Parsed::Version),
             "--log-file" => cfg.log_file = Some(PathBuf::from(value(&flag)?)),
+            "--watch-stdin" => cfg.watch_stdin = true,
             "-p" | "--port" => cfg.nfs_port = port(&value(&flag)?)?,
             "--mount-port" => cfg.mount_port = Some(port(&value(&flag)?)?),
             "--nlm-port" => cfg.nlm_port = Some(port(&value(&flag)?)?),
@@ -263,6 +276,7 @@ fn parse_args(args: Vec<String>) -> Result<Parsed, String> {
             "--no-symlinks" => cfg.symlinks = false,
             "--emulate-symlinks" => cfg.emulate_symlinks = true,
             "-c" | "--exports-file" => cfg.exports_file = Some(PathBuf::from(value(&flag)?)),
+            "--no-save" => no_save = true,
             "-v" | "--verbose" => cfg.verbosity += 1,
             "-vv" => cfg.verbosity += 2,
             "-q" | "--quiet" => cfg.verbosity = 0,
@@ -278,6 +292,11 @@ fn parse_args(args: Vec<String>) -> Result<Parsed, String> {
     }
     if cfg.admin_password.is_none() {
         cfg.admin_password = std::env::var("BSNFS_ADMIN_PASSWORD").ok().filter(|p| !p.is_empty());
+    }
+    if no_save {
+        cfg.exports_file = None;
+    } else if cfg.exports_file.is_none() {
+        cfg.exports_file = default_exports_file();
     }
     if let Some(file) = &cfg.exports_file
         && file.exists() {
@@ -323,7 +342,7 @@ pub fn export_spec(spec: &str) -> Result<ExportSpec, String> {
         _ => (String::new(), PathBuf::from(spec)),
     };
     let name = if name.is_empty() { default_name(&path)? } else { name };
-    Ok(ExportSpec { name: format!("/{}", name.trim_start_matches('/')), path, read_only: false })
+    Ok(ExportSpec { name: format!("/{}", name.trim_start_matches('/')), path, read_only: false, saved: false })
 }
 
 fn default_name(path: &Path) -> Result<String, String> {
@@ -345,12 +364,15 @@ pub fn load_exports(file: &Path) -> io::Result<Vec<ExportSpec>> {
         let (Some(name), Some(path)) = (f.next(), f.next()) else {
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("line {}: expected NAME<TAB>PATH", n + 1)));
         };
-        out.push(ExportSpec { name: name.into(), path: path.into(), read_only: f.next() == Some("ro") });
+        out.push(ExportSpec { name: name.into(), path: path.into(), read_only: f.next() == Some("ro"), saved: true });
     }
     Ok(out)
 }
 
 pub fn save_exports(file: &Path, exports: &[ExportSpec]) -> io::Result<()> {
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     let mut text = String::from("# bsnfs exports: NAME<TAB>PATH[<TAB>ro]\n");
     for e in exports {
         text.push_str(&format!("{}\t{}{}\n", e.name, e.path.display(), if e.read_only { "\tro" } else { "" }));
@@ -358,6 +380,27 @@ pub fn save_exports(file: &Path, exports: &[ExportSpec]) -> io::Result<()> {
     let tmp = file.with_extension("tmp");
     std::fs::write(&tmp, text)?;
     std::fs::rename(tmp, file)
+}
+
+/// This user's bsnfs data folder: `~/Library/Application Support/bsnfs` on
+/// macOS, `%APPDATA%\bsnfs` on Windows, `$XDG_CONFIG_HOME/bsnfs` (usually
+/// `~/.config/bsnfs`) elsewhere.
+pub fn user_data_dir() -> Option<PathBuf> {
+    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let base = if cfg!(target_os = "macos") {
+        env("HOME")?.join("Library/Application Support")
+    } else if cfg!(windows) {
+        env("APPDATA")?
+    } else {
+        env("XDG_CONFIG_HOME").or_else(|| Some(env("HOME")?.join(".config")))?
+    };
+    Some(base.join("bsnfs"))
+}
+
+/// Where admin page changes are saved when no `--exports-file` is given.
+/// Unit tests never read or write the real one.
+fn default_exports_file() -> Option<PathBuf> {
+    if cfg!(test) { None } else { user_data_dir().map(|d| d.join("exports")) }
 }
 
 #[cfg(test)]
@@ -409,11 +452,18 @@ mod tests {
     }
 
     #[test]
+    fn user_data_dir_is_per_user() {
+        let d = user_data_dir().unwrap();
+        assert!(d.ends_with("bsnfs"), "{}", d.display());
+        assert!(run(&["--no-save", "/"]).unwrap().exports_file.is_none());
+    }
+
+    #[test]
     fn exports_file_roundtrip() {
         let f = std::env::temp_dir().join(format!("bsnfs_exports_{}", std::process::id()));
         let specs = vec![
-            ExportSpec { name: "/a".into(), path: "/tmp".into(), read_only: false },
-            ExportSpec { name: "/b c".into(), path: "/var/tmp".into(), read_only: true },
+            ExportSpec { name: "/a".into(), path: "/tmp".into(), read_only: false, saved: true },
+            ExportSpec { name: "/b c".into(), path: "/var/tmp".into(), read_only: true, saved: true },
         ];
         save_exports(&f, &specs).unwrap();
         let back = load_exports(&f).unwrap();

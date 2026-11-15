@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bsnfs::app::{self, PortmapState, Server};
-use bsnfs::config::{Config, ExportSpec, PortmapMode};
+use bsnfs::config::{self, Config, ExportSpec, Parsed, PortmapMode};
 use bsnfs::rpc::{build_call, parse_reply};
 use bsnfs::server::{read_record, write_record};
 use bsnfs::xdr::{Cur, Xdr};
@@ -28,8 +28,14 @@ fn temp_dir() -> PathBuf {
 }
 
 fn start(root: &std::path::Path) -> Arc<Server> {
+    start_saving(root, None)
+}
+
+/// A server whose admin page saves shares to `exports_file`.
+fn start_saving(root: &std::path::Path, exports_file: Option<PathBuf>) -> Arc<Server> {
     let cfg = Config {
-        exports: vec![ExportSpec { name: "/share".into(), path: root.to_path_buf(), read_only: false }],
+        exports: vec![ExportSpec { name: "/share".into(), path: root.to_path_buf(), read_only: false, saved: false }],
+        exports_file,
         bind: "127.0.0.1".parse().unwrap(),
         nfs_port: 0,
         portmap: PortmapMode::Own,
@@ -512,7 +518,8 @@ fn http(addr: SocketAddr, req: &str) -> (u16, String) {
 fn admin_api_lists_and_changes_exports() {
     let root = temp_dir();
     let extra = temp_dir();
-    let s = start(&root);
+    let saves = temp_dir().join("exports");
+    let s = start_saving(&root, Some(saves.clone()));
     let admin = s.ports.admin.unwrap();
 
     let (st, page) = http(admin, "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
@@ -540,6 +547,19 @@ fn admin_api_lists_and_changes_exports() {
     // The new export is mountable right away.
     let mut c = Client::udp(s.ports.nfs);
     mount3(&mut c, b"/extra");
+
+    // It was saved; /share, from the command line, wasn't.
+    let saved = std::fs::read_to_string(&saves).unwrap();
+    assert!(saved.contains("/extra\t"), "{saved}");
+    assert!(!saved.contains("/share\t"), "command-line shares stay out of the file: {saved}");
+    assert!(body.contains("\"ok\":true"));
+
+    // And it comes back on the next start.
+    let args = ["--no-admin", "--exports-file", saves.to_str().unwrap(), root.to_str().unwrap()];
+    let Ok(Parsed::Run(cfg)) = config::parse(args.iter().map(std::ffi::OsString::from)) else { panic!("config") };
+    let names: Vec<_> = cfg.exports.iter().map(|e| (e.name.as_str(), e.saved)).collect();
+    assert!(names.contains(&("/extra", true)), "{names:?}");
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&extra).ok();
+    std::fs::remove_dir_all(saves.parent().unwrap()).ok();
 }

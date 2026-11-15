@@ -84,6 +84,7 @@ form.add { display: grid; grid-template-columns: 160px 1fr auto auto auto; gap: 
     </form>
     <div class="browser" id="browser"></div>
     <div class="error" id="add-error"></div>
+    <div class="muted" id="save-note"></div>
   </section>
 
   <section>
@@ -165,6 +166,10 @@ function render(s) {
       <td><button class="danger" data-rm="${e.id}" data-name="${esc(e.name)}">Stop sharing</button></td>
     </tr>`, "Nothing shared yet. Add a folder below.", 6);
 
+  $("save-note").innerHTML = s.exports_file
+    ? `Shares you add here are saved in <code>${esc(s.exports_file)}</code> and come back when bsnfs restarts.`
+    : "Shares you add here last until bsnfs stops (it was started with --no-save).";
+
   rows($("mounts"), s.mounts, (m) => `<tr>
       <td>${esc(m.host)}${m.host !== m.client ? ` <span class="muted">${esc(m.client)}</span>` : ""}</td>
       <td><code>${esc(m.path)}</code></td><td class="num">${dur(m.since)}</td></tr>`,
@@ -195,7 +200,7 @@ function render(s) {
     ["Lock manager", s.ports.nlm === null ? "off (clients should mount with -o nolock)" : `port ${s.ports.nlm} (grants every lock)`],
     ["Portmapper", pm.mode === "own" ? `built-in, port ${pm.port}` : pm.mode === "system" ? "registered with the host's portmapper" : "off: clients need explicit port options"],
     ["Permissions", "synthetic: every file is shown as owned by the client user asking, and every access is granted"],
-    ["Exports file", s.exports_file ? `<code>${esc(s.exports_file)}</code> (changes here are saved)` : "none: changes here last until restart"],
+    ["Saved shares", s.exports_file ? `Shares you add here are saved in <code>${esc(s.exports_file)}</code> and come back when bsnfs restarts.` : "Not saved (started with --no-save): shares you add here last until bsnfs stops."],
   ];
   $("server").innerHTML = server.map(([k, v]) => `<tr><th style="width:180px">${k}</th><td>${v}</td></tr>`).join("");
 }

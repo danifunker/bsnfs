@@ -43,6 +43,9 @@ pub struct Server {
     pub dispatcher: Arc<Dispatcher>,
     pub ports: Ports,
     registered: Vec<Mapping>,
+    /// Shares given on the command line or in a config file. They're kept
+    /// there, so the admin page's saves leave them out.
+    fixed_exports: std::collections::HashSet<String>,
     /// Serializes admin changes to the exports and their file.
     pub exports_lock: Mutex<()>,
 }
@@ -128,7 +131,9 @@ pub fn start(cfg: Config) -> io::Result<Arc<Server>> {
     };
 
     let ports = Ports { nfs: nfs_port, mount: mount_port, nlm: nlm_port, portmap: portmap_state, admin: None };
-    let mut server = Server { cfg, vfs, mount, dispatcher: d, ports, registered, exports_lock: Mutex::new(()) };
+    let fixed_exports = cfg.exports.iter().filter(|e| !e.saved).map(|e| e.name.clone()).collect();
+    let mut server =
+        Server { cfg, vfs, mount, dispatcher: d, ports, registered, fixed_exports, exports_lock: Mutex::new(()) };
     if let Some(addr) = server.cfg.admin {
         let listener = TcpListener::bind(addr).map_err(|e| io::Error::new(e.kind(), format!("admin UI: cannot listen on {addr}: {e}")))?;
         server.ports.admin = Some(listener.local_addr()?);
@@ -202,6 +207,10 @@ impl Server {
         if let Some(a) = p.admin {
             info!("  admin page on http://{a}/");
         }
+        match &self.cfg.exports_file {
+            Some(f) => info!("  shares added on the admin page are saved in {}", f.display()),
+            None => info!("  shares added on the admin page last until bsnfs stops (--no-save)"),
+        }
         let exports = self.vfs.exports();
         if exports.is_empty() {
             warn!("no folders shared yet; add some on the admin page");
@@ -221,14 +230,15 @@ impl Server {
         }
     }
 
-    /// Persist the current exports, if an exports file is configured.
+    /// Save the shares managed on the admin page, if there's an exports file.
     pub fn save_exports(&self) -> io::Result<()> {
         let Some(file) = &self.cfg.exports_file else { return Ok(()) };
         let specs: Vec<ExportSpec> = self
             .vfs
             .exports()
             .into_iter()
-            .map(|(_, e)| ExportSpec { name: e.name.clone(), path: e.root.clone(), read_only: e.read_only() })
+            .filter(|(_, e)| !self.fixed_exports.contains(&e.name))
+            .map(|(_, e)| ExportSpec { name: e.name.clone(), path: e.root.clone(), read_only: e.read_only(), saved: true })
             .collect();
         config::save_exports(file, &specs)
     }
