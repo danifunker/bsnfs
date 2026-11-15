@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.danifunker.bsnfs</string>
+	<key>CFBundleName</key>
+	<string>bsnfs</string>
+	<key>CFBundleDisplayName</key>
+	<string>bsnfs</string>
+	<key>CFBundleExecutable</key>
+	<string>bsnfs</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<!-- Set by scripts/dist/package-macos.sh. -->
+	<key>CFBundleShortVersionString</key>
+	<string>0.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<!-- A menu-bar app: no Dock icon, no main window. -->
+	<key>LSUIElement</key>
+	<true/>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>© 2026 danifunker. MIT License.</string>
+	<!-- Shown when macOS asks to let bsnfs into protected places. The bundled
+	     server runs as a child of the app, so these prompts name bsnfs. -->
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>bsnfs shares the folders you choose with computers on your network.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>bsnfs shares the folders you choose with computers on your network.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>bsnfs shares the folders you choose with computers on your network.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>bsnfs shares the folders you choose with computers on your network, including ones on removable disks.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>bsnfs shares the folders you choose with computers on your network, including ones on network drives.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>bsnfs serves the folders you share to computers on your local network.</string>
+</dict>
+</plist>

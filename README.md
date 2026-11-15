@@ -24,7 +24,8 @@ Download the file for your system from the
 | Fedora, RHEL, openSUSE | `bsnfs-linux-x64-….rpm` | `sudo dnf install ./bsnfs-linux-*.rpm` |
 | Arch | `bsnfs-linux-x64-….pkg.tar.zst` | `sudo pacman -U bsnfs-linux-*.pkg.tar.zst` |
 | Any Linux | `bsnfs-linux-x64-….AppImage` or `.tar.gz` | `chmod +x` the AppImage and run it, or unpack the tarball. |
-| macOS 10.13+ (Intel), 11+ (Apple silicon) | `bsnfs-macos-universal-….tar.gz` | Unpack, then `sudo mv bsnfs /usr/local/bin/`. |
+| macOS 11+ (Apple silicon or Intel) | `bsnfs-macos-universal-….dmg` | Open it and drag **bsnfs** to Applications, then open it. See [The Mac app](#the-mac-app). |
+| macOS, command line only (10.13+) | `bsnfs-macos-universal-….tar.gz` | Unpack, then `sudo mv bsnfs /usr/local/bin/`. |
 
 Every Linux build is a single static program, so it runs on any distribution.
 There's a new release for every change; the version is its date and time
@@ -85,15 +86,44 @@ While bsnfs is running, open <http://127.0.0.1:8080/>. From there you can:
 - copy the mount command for each share
 - see which machines have what mounted, and recent activity
 
-Shares you add here disappear when bsnfs stops, unless you start it with a
-file to save them in:
+Shares you add here are saved automatically and come back the next time
+bsnfs starts. They're kept in a small text file for your user:
 
-```sh
-bsnfs -c ~/.bsnfs-exports
-```
+| System | Saved in |
+| --- | --- |
+| macOS | `~/Library/Application Support/bsnfs/exports` |
+| Linux | `~/.config/bsnfs/exports` |
+| Windows | `%APPDATA%\bsnfs\exports` |
+
+(`-c FILE` saves somewhere else; `--no-save` keeps changes only until bsnfs
+stops.) Folders you name on the command line aren't saved there: they're
+shared whenever you start bsnfs with them.
 
 To use the page from another machine, give it a password (it won't start
 without one): `bsnfs --admin 0.0.0.0:8080 --admin-password something ~/Shared`.
+
+### The Mac app
+
+On a Mac, the easiest way to run bsnfs is the app from the `.dmg`. It sits in
+the menu bar (no Dock icon, no Terminal window) and runs the same server:
+
+- The first time you open it, it opens the admin page so you can add a
+  folder. Shares you add are saved, as above.
+- The menu shows whether it's running and how many folders it shares, and
+  has **Open Admin Page**, **Restart Server**, **Show Log** and, on macOS 13
+  and later, **Start at Login**.
+- When macOS asks for access to Desktop, Documents, Downloads or an external
+  disk, the request names bsnfs, and you can grant it under System Settings >
+  Privacy & Security.
+- Its log is `~/Library/Logs/bsnfs.log`. For settings beyond the admin page
+  (ports, a password, read-only), put options in
+  `~/Library/Application Support/bsnfs/bsnfs.conf`, one per line as in a
+  [service config](#5-run-it-as-a-service), and choose **Restart Server**.
+- The command-line program is inside the app too, if you want it in a
+  terminal: `/Applications/bsnfs.app/Contents/MacOS/bsnfs-cli`.
+
+The app is signed and notarized by Apple, so macOS opens it after a single
+"downloaded from the internet" confirmation.
 
 ### 5. Run it as a service
 
@@ -141,9 +171,10 @@ Notes:
   `/etc/bsnfs/bsnfs.conf` and run `sudo systemctl enable --now bsnfs`, making
   sure the `bsnfs` account can read the folders. Or run it as yourself
   instead with `sudo bsnfs service install --user you /path/to/folder`.
-- **macOS** keeps services out of Desktop, Documents, Downloads, iCloud
-  Drive and external disks. To share a folder there, add the `bsnfs` program
-  under System Settings > Privacy & Security > Full Disk Access.
+- **macOS**: the [Mac app](#the-mac-app) with Start at Login is simpler. A
+  `launchd` service can't reach Desktop, Documents, Downloads, iCloud Drive
+  or external disks; to share a folder there, add the `bsnfs` program under
+  System Settings > Privacy & Security > Full Disk Access.
 - **Windows**: the service runs as LocalSystem, which can read every file,
   unless you install it with `--user NAME --password PW`. Its log is
   `C:\ProgramData\bsnfs\bsnfs.log`.
@@ -303,8 +334,10 @@ bsnfs service uninstall
       --no-symlinks        refuse client requests to create symlinks
       --emulate-symlinks   store client symlinks as `symlink-NAME` files
                            (always on for Windows hosts)
-  -c, --exports-file FILE  load shares from FILE; web page changes are saved there
+  -c, --exports-file FILE  where web page changes are saved (default: per user, see above)
+      --no-save            don't save web page changes
       --log-file FILE      log to FILE instead of the terminal
+      --watch-stdin        exit when standard input closes (used by the Mac app)
   -v / -vv / -q            log every request / also errors / warnings only
   -V, --version
   -h, --help
@@ -388,8 +421,8 @@ runs. `.github/workflows/`:
   other branches.
 
 What gets built: Windows x86, x64 and ARM64 (zip and installer; Windows 10+,
-ARM64 for Windows 11); macOS as one universal binary (10.13+ Intel, 11+ Apple
-silicon); Linux x64, ARM64 and RISC-V 64 as static binaries in tarballs, deb,
+ARM64 for Windows 11); macOS as a menu-bar app in a .dmg (11+) and as a bare
+universal binary (10.13+ Intel, 11+ Apple silicon); Linux x64, ARM64 and RISC-V 64 as static binaries in tarballs, deb,
 rpm and Arch packages, plus AppImages for x64 and ARM64. riscv64 is
 cross-built on x86-64 and checked under QEMU.
 

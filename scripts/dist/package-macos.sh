@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Build bsnfs for macOS as one universal (arm64 + x86_64) binary and package
-# it as a tarball. It runs on macOS 10.13+ on Intel (utimensat, which bsnfs
-# uses to set file times, arrived in 10.13) and macOS 11+ on Apple silicon
-# (the first release for it).
+# Build bsnfs for macOS as universal (arm64 + x86_64) binaries and package:
+#   - bsnfs.app, a menu-bar app around the server, in a .dmg (macOS 11+)
+#   - the bare command-line program in a tarball: macOS 10.13+ on Intel
+#     (utimensat, which bsnfs uses to set file times, arrived in 10.13) and
+#     11+ on Apple silicon (the first release for it)
 #
 #   scripts/dist/package-macos.sh [options]
 #
-# bsnfs is a command-line program, so there is no .app: the binary itself is
-# signed with the hardened runtime and notarized, which is what Gatekeeper
-# checks on a downloaded executable. Signing and notarization run when their
+# Everything is signed with the hardened runtime and notarized; the app and
+# the .dmg get their tickets stapled. Signing and notarization run when their
 # credentials are present and are skipped (ad-hoc signature) when not:
 #
 #   MACOS_SIGN_IDENTITY   a "Developer ID Application: ..." identity in your
@@ -86,20 +86,94 @@ minos() {  # <arch>
 [ "$(minos arm64)" = "$MIN_ARM64" ] || die "arm64 slice targets macOS $(minos arm64), not $MIN_ARM64"
 log "minimum macOS: $(minos x86_64) (Intel), $(minos arm64) (Apple silicon)"
 
-group_start "sign"
-if [ "$IDENTITY" = "-" ]; then
-    codesign --force --sign - "$WORK/bsnfs"
+# ── bsnfs.app ────────────────────────────────────────────────────────────────
+# A menu-bar app (macos/main.swift) that runs the same server, bundled inside
+# as Contents/MacOS/bsnfs-cli. Needs macOS 11 (SF Symbols for its menu icon).
+APP_MIN=11.0
+need xcrun hdiutil
+group_start "bsnfs.app"
+for arch in arm64 x86_64; do
+    xcrun --sdk macosx swiftc -O -swift-version 5 -target "$arch-apple-macos$APP_MIN" \
+        -o "$WORK/menu-$arch" macos/main.swift
+done
+lipo -create -output "$WORK/menu" "$WORK/menu-arm64" "$WORK/menu-x86_64"
+APP="$WORK/app/bsnfs.app"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp "$WORK/menu" "$APP/Contents/MacOS/bsnfs"
+cp macos/Info.plist "$APP/Contents/Info.plist"
+cp macos/AppIcon.icns LICENSE LICENSE-iris.txt "$APP/Contents/Resources/"
+# Bundle versions are at most three numbers: YYYY.MM.DD.HHMMSS becomes
+# 2026.10.28 (shown) and 20261028.192448 (build); X.Y.Z stays X.Y.Z.
+if [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(\.([0-9]+))?$ ]]; then
+    SHORT="$((10#${BASH_REMATCH[1]})).$((10#${BASH_REMATCH[2]})).$((10#${BASH_REMATCH[3]}))"
+    if [ -n "${BASH_REMATCH[5]}" ]; then
+        BUILD="${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[3]}.$((10#${BASH_REMATCH[5]}))"
+    else
+        BUILD="$SHORT"
+    fi
 else
-    codesign --force --options runtime --timestamp --identifier io.github.danifunker.bsnfs --sign "$IDENTITY" "$WORK/bsnfs"
+    SHORT=0.0.0; BUILD=0
 fi
-codesign --verify --verbose "$WORK/bsnfs"
+plist() { /usr/libexec/PlistBuddy -c "$1" "$APP/Contents/Info.plist"; }
+plist "Set :CFBundleShortVersionString $SHORT"
+plist "Set :CFBundleVersion $BUILD"
+plist "Add :BSNFSVersion string $VERSION"
+group_end
+
+# ── sign, inside out ────────────────────────────────────────────────────────
+sign() {  # <path> [identifier]
+    if [ "$IDENTITY" = "-" ]; then
+        codesign --force --sign - ${2:+--identifier "$2"} "$1"
+    else
+        codesign --force --options runtime --timestamp ${2:+--identifier "$2"} --sign "$IDENTITY" "$1"
+    fi
+}
+group_start "sign"
+sign "$WORK/bsnfs" io.github.danifunker.bsnfs.cli
+cp "$WORK/bsnfs" "$APP/Contents/MacOS/bsnfs-cli"
+sign "$APP"   # identifier from Info.plist: io.github.danifunker.bsnfs
+codesign --verify --strict --verbose "$WORK/bsnfs"
+codesign --verify --deep --strict --verbose "$APP"
 group_end
 "$WORK/bsnfs" --version
+"$APP/Contents/MacOS/bsnfs-cli" --version
+lipo -archs "$APP/Contents/MacOS/bsnfs" | sed 's/^/app architectures: /'
 
-# A bare executable can't carry a stapled ticket; notarizing still registers
-# it, so Gatekeeper's online check passes on first run.
-ditto -c -k "$WORK/bsnfs" "$WORK/notarize.zip"
+# Stapling fetches the ticket from Apple's CDN, which can drop the connection
+# or not have it yet right after acceptance: try a few times. Unstapled, a
+# notarized file still opens; Gatekeeper looks the ticket up online.
+staple() {  # <path>
+    [ "${#NOTARY[@]}" -gt 0 ] || return 0
+    local attempt
+    for attempt in 1 2 3 4 5 6; do
+        xcrun stapler staple "$1" && return 0
+        log "staple attempt $attempt for $(basename "$1") failed; retrying in 30 s"
+        sleep 30
+    done
+    warn "$(basename "$1") is notarized but not stapled: Apple's ticket service didn't answer"
+}
+
+# One submission covers the app and the bare command-line binary. The app
+# gets the ticket stapled (so it opens offline); a bare executable can't hold
+# one, and Gatekeeper finds its ticket online.
+mkdir "$WORK/notarize"
+cp -R "$APP" "$WORK/bsnfs" "$WORK/notarize/"
+ditto -c -k "$WORK/notarize" "$WORK/notarize.zip"
 notarize "$WORK/notarize.zip"
+staple "$APP"
+
+# ── outputs ──────────────────────────────────────────────────────────────────
+group_start "dmg"
+DMG="$OUT_DIR/bsnfs-macos-universal-${VERSION}.dmg"
+mkdir "$WORK/dmg"
+cp -R "$APP" "$WORK/dmg/"
+ln -s /Applications "$WORK/dmg/Applications"
+rm -f "$DMG"
+hdiutil create -volname "bsnfs" -srcfolder "$WORK/dmg" -fs HFS+ -format UDZO -ov "$DMG"
+[ "$IDENTITY" = "-" ] || codesign --force --timestamp --sign "$IDENTITY" "$DMG"
+group_end
+notarize "$DMG"
+staple "$DMG"
 
 OUT="$OUT_DIR/bsnfs-macos-universal-${VERSION}.tar.gz"
 cp "${DOC_FILES[@]}" "$WORK/"

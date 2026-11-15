@@ -31,6 +31,15 @@ fn main() {
         }
     };
 
+    if cfg.watch_stdin {
+        // Our parent holds stdin open; when it exits, even if killed, the
+        // pipe closes and so do we.
+        std::thread::spawn(|| {
+            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+            STOP.store(true, Ordering::SeqCst);
+        });
+    }
+
     // SAFETY: the handler only stores to an atomic, which is signal-safe.
     unsafe {
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);

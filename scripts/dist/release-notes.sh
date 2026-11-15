@@ -47,6 +47,7 @@ assets() {
     for a in x64 arm64; do
         echo "bsnfs-linux-${a}-${V}.AppImage"
     done
+    echo "bsnfs-macos-universal-${V}.dmg"
     echo "bsnfs-macos-universal-${V}.tar.gz"
 }
 
@@ -82,13 +83,13 @@ cat <<EOF
 | Windows 10/11, x64 | $(dl Installer "bsnfs-setup-windows-x64-${V}.exe") | $(dl zip "bsnfs-windows-x64-${V}.zip") |
 | Windows 10/11, 32-bit x86 | $(dl Installer "bsnfs-setup-windows-x86-${V}.exe") | $(dl zip "bsnfs-windows-x86-${V}.zip") |
 | Windows 11 on ARM | $(dl Installer "bsnfs-setup-windows-arm64-${V}.exe") | $(dl zip "bsnfs-windows-arm64-${V}.zip") |
-| macOS 10.13+ (Intel), 11+ (Apple silicon) | | $(dl tar.gz "bsnfs-macos-universal-${V}.tar.gz") |
+| macOS, Apple silicon and Intel | $(dl "App (dmg)" "bsnfs-macos-universal-${V}.dmg"), macOS 11+ | $(dl tar.gz "bsnfs-macos-universal-${V}.tar.gz"), macOS 10.13+ |
 | Linux x64 | $(dl deb "bsnfs-linux-x64-${V}.deb") · $(dl rpm "bsnfs-linux-x64-${V}.rpm") · $(dl "Arch pkg" "bsnfs-linux-x64-${V}.pkg.tar.zst") | $(dl AppImage "bsnfs-linux-x64-${V}.AppImage") · $(dl tar.gz "bsnfs-linux-x64-${V}.tar.gz") |
 | Linux arm64 | $(dl deb "bsnfs-linux-arm64-${V}.deb") · $(dl rpm "bsnfs-linux-arm64-${V}.rpm") · $(dl "Arch pkg" "bsnfs-linux-arm64-${V}.pkg.tar.zst") | $(dl AppImage "bsnfs-linux-arm64-${V}.AppImage") · $(dl tar.gz "bsnfs-linux-arm64-${V}.tar.gz") |
 | Linux riscv64 | $(dl deb "bsnfs-linux-riscv64-${V}.deb") · $(dl rpm "bsnfs-linux-riscv64-${V}.rpm") · $(dl "Arch pkg" "bsnfs-linux-riscv64-${V}.pkg.tar.zst") | $(dl tar.gz "bsnfs-linux-riscv64-${V}.tar.gz") |
 
 - **Windows:** the installer can set bsnfs up as a service and opens its admin page.
 - **Linux:** the packages install a systemd service (\`bsnfs\`, not started until you add a folder to \`/etc/bsnfs/bsnfs.conf\`). Every Linux binary is static and runs on any distribution; the AppImage is the same program in one file.
-- **macOS:** one file for Intel and Apple silicon. Unpack, then run \`./bsnfs ~/folder\`, or \`sudo ./bsnfs service install ~/folder\` to run it at boot.
+- **macOS:** open the dmg and drag bsnfs to Applications. It runs in the menu bar, opens its admin page on first launch, and can start at login. The tar.gz is the same server as a bare command-line program.
 EOF
 } > "${OUT:-/dev/stdout}"
